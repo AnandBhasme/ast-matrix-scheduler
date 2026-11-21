@@ -83,7 +83,7 @@ class FP:
             return m[1]
         if k in self.active:
             return "<cycle>"
-        if depth > 40:
+        if depth > 120:  # deepest sqlglot dict nesting is ~20 (time tries)
             return "<deep>"
         self.active.add(k)
         try:

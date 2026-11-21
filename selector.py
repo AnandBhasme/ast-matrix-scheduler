@@ -290,6 +290,8 @@ class Selector:
             if old is None and new is not None and not new.startswith("sqlglot/"):
                 if new.startswith("tests/") and new.endswith(".py"):
                     return ALL  # a new test module we have no numbers for: be safe
+                if new.endswith((".py", ".pth")):
+                    return ALL  # e.g. a root-level module shadowing the stdlib (cwd is on sys.path)
                 return set()  # e.g. new doc file
             return ALL
         if path.startswith("sqlglot/") and path.endswith(".py"):
@@ -1759,7 +1761,12 @@ def main():
             try:
                 if all((f["new"] or "").startswith("sqlglot/") and (f["new"] or "").endswith(".py")
                        and f["old"] == f["new"] for f in files):
-                    chosen = verify_prune(sel, chosen, ms, cid)
+                    # removed sorted()/sort(): order may depend on the hash seed, which a
+                    # single verifier process cannot explore -> never prune by verification
+                    unsort = re.search(r"^-(?!--).*(?:\bsorted\(|\.sort\()", text, re.M) and not \
+                        re.search(r"^\+(?!\+\+).*(?:\bsorted\(|\.sort\()", text, re.M)
+                    if not unsort:
+                        chosen = verify_prune(sel, chosen, ms, cid)
             except Exception as e:
                 print(f"{cid}: verify error {e!r}", file=sys.stderr)
             if os.environ.get("BR_CASES") == "1":  # off: measured CPU > saving
