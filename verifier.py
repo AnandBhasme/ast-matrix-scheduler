@@ -32,10 +32,9 @@ SRC = os.environ.get("SRC_DIR", os.path.join(os.path.dirname(os.path.abspath(__f
 
 # ---------------------------------------------------------------- in-process pool
 def _rt(obj):
-    try:
-        return pickle.loads(pickle.dumps(obj))
-    except Exception:
-        return obj
+    # exactly what a spawn pool does to arguments and results: a pickling failure
+    # must surface (as it would in the real pool), never be papered over
+    return pickle.loads(pickle.dumps(obj))
 
 
 class SyncExecutor(cf.Executor):
@@ -187,7 +186,8 @@ def main():
     for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
         if not m.name.endswith("__main__"):
             importlib.import_module(m.name)
-    for heavy in ("duckdb", "pandas", "numpy", "pandas.testing", "tests", "tests.helpers"):
+    # pandas / duckdb are imported lazily by the (few) tests that need them
+    for heavy in ("tests", "tests.helpers"):
         try:
             importlib.import_module(heavy)
         except Exception:

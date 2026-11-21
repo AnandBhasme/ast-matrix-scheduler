@@ -23,7 +23,6 @@ DATA = Path(os.environ.get("DATA_DIR", "/data"))
 APP = Path(__file__).resolve().parent
 SRC = Path(os.environ.get("SRC_DIR", APP / "src"))
 MAP = Path(os.environ.get("MAP_FILE", APP / "map.json.gz"))
-WM_PATH = Path(os.environ.get("WM_FILE", APP / "wm.json.gz"))
 DEBUG = os.environ.get("BR_DEBUG") == "1"
 
 ALL = "ALL"  # sentinel: run everything
@@ -253,6 +252,7 @@ class Selector:
         self.patched = {}  # rel -> patched source
         self.need_imp = False
         self.swap_ok = True  # every change is a function-body edit (code hot-swap safe)
+        self.imp_changed = False
 
     # ---- coverage lookups
     def cov_span(self, rel, s, e, replayable=True):
@@ -479,17 +479,15 @@ class Selector:
                     fs = scope.lineno
                     out |= self.cov_span(rel, fs, scope.end_lineno)
                 else:
-                    hit_new = new_idx.innermost(c)
-                    swap = find_single_compare_swap(node, hit_new[2]) if hit_new else None
-                    if swap:
-                        t = wm_tests(self, rel, swap[0], swap[1], swap[2])
-                        if t is not None:
-                            log(f"  wm swap {rel} {swap[0]} {swap[1]}->{swap[2]}: {len(t)} tests")
-                            W = wm_data(self)
-                            inc = (W.get("_incomplete", set()) if W else set()) & self.cov_span(rel, s, e)
-                            out |= (t | inc)
-                            continue
-                    out |= self.cov_span(rel, s, e)
+                    cov = self.cov_span(rel, s, e)
+                    inf = self.infected_tests(rel, node, new_idx, c)
+                    if inf is not None:
+                        keep = cov & (inf | self.inf_incomplete())
+                        log(f"  infection {rel}:{c}: {len(cov)} covering -> {len(keep)} infected")
+                        self.spare |= cov - keep
+                        out |= keep
+                    else:
+                        out |= cov
                 continue
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.swap_ok = False  # def header / decorator / defaults
@@ -514,8 +512,15 @@ class Selector:
                 # runs only when the lambda is called, so its test-time line coverage
                 # is exact; the import diff still catches import-time calls/failures
                 log(f"  lambda body edit {rel}:{lam.lineno}-{lam.end_lineno}")
-                out |= self.cov_span(rel, lam.lineno, lam.end_lineno)
-                self.defer_import()
+                cov = self.cov_span(rel, lam.lineno, lam.end_lineno)
+                inf = self.infected_tests(rel, node, new_idx, c)
+                if inf is not None:
+                    keep = cov & (inf | self.inf_incomplete())
+                    log(f"  infection {rel}:{c}: {len(cov)} covering -> {len(keep)} infected")
+                    self.spare |= cov - keep
+                    cov = keep
+                out |= cov
+                self.defer_import(swap_safe=True)
                 continue
             if kind == "ins":
                 r = self.level_insert(rel, module, idx, new_idx, ln, chain)
@@ -617,17 +622,123 @@ class Selector:
                     best = node
         return best
 
+    # ---- weak-mutation infection (infect.json.gz, built by tools/brinfect.py)
+    def infect(self):
+        d = getattr(self, "_infect", None)
+        if d is None:
+            d = {}
+            try:
+                with gzip.open(INFECT, "rt") as f:
+                    d = json.load(f)
+                tr = [self.by_id.get(i) for i in d["ids"]]
+                d["_tr"] = tr
+            except Exception as e:
+                log(f"  infection map unavailable: {e!r}")
+                d = {}
+            self._infect = d
+        return d
+
+    def inf_set(self, i):
+        d = self.infect()
+        tr = d["_tr"]
+        return {tr[x] for x in d["sets"][i] if tr[x] is not None}
+
+    def inf_incomplete(self):
+        d = self.infect()
+        return self.inf_set(d["incomplete"]) if d else set()
+
+    def infected_tests(self, rel, old_stmt, new_idx, ln):
+        """Tests in which the edited comparison / boolean operator would produce a
+        different outcome than the pinned code at least once. None = unknown."""
+        if not INFECT_ON:
+            return None
+        d = self.infect()
+        if not d or rel not in d.get("inst", {}):
+            return None
+        hit = new_idx.innermost(ln)
+        if hit is None or type(hit[2]) is not type(old_stmt):
+            return None
+        site = _single_site_edit(old_stmt, hit[2])
+        if site is None:
+            return None
+        kind, onode, nnode = site
+        key = f"{onode.lineno}:{onode.col_offset}:{onode.end_lineno}:{onode.end_col_offset}"
+        inst = d["inst"][rel].get(key)
+        if kind == "cmp":
+            oop, nop = type(onode.ops[0]).__name__, type(nnode.ops[0]).__name__
+            if inst != ["cmp", oop]:
+                return None
+            c = d["cmp"].get(rel, {}).get(key)
+            if c is None:
+                return set()  # instrumented and never evaluated by any test
+            changed_operands = [
+                k for k, (a, b) in enumerate(((onode.left, nnode.left), (onode.comparators[0], nnode.comparators[0])))
+                if _norm(a) != _norm(b)
+            ]
+            if not changed_operands:
+                if nop in c["imp"] or ("OPQ" in c["imp"] and nop not in ("Is", "IsNot")):
+                    return None
+                out = self.inf_set(c["alt"][nop]) if nop in c["alt"] else set()
+                if nop not in ("Is", "IsNot"):
+                    out |= self.inf_set(c["opq"])
+                return out
+            # literal operand change (optionally with an operator change)
+            if c["pairs"] is None or c["imp_pairs"] or c["imp"]:
+                return None
+            newvals = {}
+            for k in changed_operands:
+                sub = (nnode.left, nnode.comparators[0])[k]
+                try:
+                    newvals[k] = ast.literal_eval(sub)
+                    ast.literal_eval((onode.left, onode.comparators[0])[k])
+                except Exception:
+                    return None
+            out = self.inf_set(c["opq"])
+            ofn, nfn = _CMP_OPS[oop], _CMP_OPS[nop]
+            for lrep, rrep, si in c["pairs"]:
+                if lrep is None or rrep is None:
+                    out |= self.inf_set(si)
+                    continue
+                try:
+                    lv, rv = ast.literal_eval(lrep), ast.literal_eval(rrep)
+                except Exception:
+                    out |= self.inf_set(si)
+                    continue
+                nv = [newvals.get(0, lv), newvals.get(1, rv)]
+                if _cmp_outcome(ofn, lv, rv) != _cmp_outcome(nfn, nv[0], nv[1]):
+                    out |= self.inf_set(si)
+            return out
+        if kind == "bool":
+            oop, nop = type(onode.op).__name__, type(nnode.op).__name__
+            if inst != ["bool", oop] or oop == nop:
+                return None
+            b = d["bool"].get(rel, {}).get(key)
+            if b is None:
+                return set()
+            ok_pat = [True, True] if oop == "And" else [False, False]
+            if any(list(p) != ok_pat for p in b["imp"]):
+                return None
+            out = set()
+            for ta, tb, si in b["pat"]:
+                if [ta, tb] != ok_pat:
+                    out |= self.inf_set(si)
+            return out
+        return None
+
     def runs_at_import(self, rel, s, e):
         lines = self._imp_sets.get(rel)
         if lines is None:
             lines = self._imp_sets[rel] = set(self.imp.get(rel, ()))
         return any(ln in lines for ln in range(s, e + 1))
 
-    def defer_import(self):
+    def defer_import(self, swap_safe=False):
         """The change only acts through import-time state: resolve it after all files
-        are seen, by diffing the patched import against the pinned one."""
+        are seen, by diffing the patched import against the pinned one.
+        swap_safe: the edit is code (e.g. a lambda body) that a code hot-swap reproduces
+        exactly as long as the import diff finds no import-time state change."""
         self.need_imp = True
-        self.swap_ok = False
+        if not swap_safe:
+            self.swap_ok = False
         return set()
 
     def level_insert(self, rel, module, idx, new_idx, ln, chain):
@@ -800,6 +911,78 @@ def _line_pairs(hunks):
     return pairs
 
 
+INFECT = Path(os.environ.get("INFECT_FILE", APP / "infect.json.gz"))
+INFECT_ON = os.environ.get("BR_INFECT", "1") != "0"
+_CMP_OPS = {
+    "Eq": lambda a, b: a == b, "NotEq": lambda a, b: a != b, "Lt": lambda a, b: a < b,
+    "LtE": lambda a, b: a <= b, "Gt": lambda a, b: a > b, "GtE": lambda a, b: a >= b,
+    "Is": lambda a, b: a is b, "IsNot": lambda a, b: a is not b,
+    "In": lambda a, b: a in b, "NotIn": lambda a, b: a not in b,
+}
+
+
+def _cmp_outcome(fn, a, b):
+    try:
+        r = fn(a, b)
+    except Exception as e:
+        return ("E", type(e).__name__, str(e)[:200])
+    return r if type(r) is bool else ("V", repr(r))
+
+
+def _single_site_edit(old, new):
+    """If old and new statements differ only inside one single-operator comparison
+    (its operator and/or literal operands) or only in the operator of one 2-operand
+    and/or, return (kind, old_node, new_node); else None."""
+    diffs = []
+
+    def walk(o, n, anc):
+        if type(o) is not type(n):
+            diffs.append((o, n, anc))
+            return
+        if isinstance(o, ast.AST):
+            here = anc + [(o, n)]
+            for f in o._fields:
+                a, b = getattr(o, f, None), getattr(n, f, None)
+                if isinstance(a, list) or isinstance(b, list):
+                    if not isinstance(a, list) or not isinstance(b, list) or len(a) != len(b):
+                        diffs.append((o, n, anc))
+                        continue
+                    for x, y in zip(a, b):
+                        walk(x, y, here)
+                elif isinstance(a, ast.AST) or isinstance(b, ast.AST):
+                    walk(a, b, here)
+                elif a != b:
+                    diffs.append((o, n, anc))
+            return
+        if o != n:
+            diffs.append((o, n, anc))
+
+    walk(old, new, [])
+    if not diffs:
+        return None
+    site = None
+    for o, n, anc in diffs:
+        chain = anc + ([(o, n)] if isinstance(o, ast.AST) else [])
+        found = None
+        for oa, na in reversed(chain):
+            if isinstance(oa, ast.Compare) and isinstance(na, ast.Compare) and len(oa.ops) == 1 and len(na.ops) == 1:
+                found = ("cmp", oa, na)
+                break
+            if isinstance(oa, ast.BoolOp) and isinstance(na, ast.BoolOp) and len(oa.values) == 2 and len(na.values) == 2:
+                found = ("bool", oa, na)
+                break
+        if found is None:
+            return None
+        if site is None:
+            site = found
+        elif site[1] is not found[1]:
+            return None
+    kind, oa, na = site
+    if kind == "bool" and any(_norm(x) != _norm(y) for x, y in zip(oa.values, na.values)):
+        return None  # operands changed too
+    return site
+
+
 def _qualname(path, upto):
     parts = []
     for a in path:
@@ -873,77 +1056,6 @@ class _Equiv(ast.NodeTransformer):
 
 def _norm_list(xs):
     return tuple(_norm(x) for x in xs)
-
-
-_wm_state = {"data": None}
-
-
-def wm_data(sel):
-    if _wm_state["data"] is None:
-        if WM_PATH.is_file():
-            try:
-                with gzip.open(WM_PATH, "rt") as f:
-                    d = json.load(f)
-                nums = [sel.by_id.get(i) for i in d["tests"]]
-                d["_nums"] = nums
-                d["_incomplete"] = {nums[i] for i in d["incomplete"] if nums[i] is not None}
-                _wm_state["data"] = d
-            except Exception:
-                _wm_state["data"] = {}
-        else:
-            _wm_state["data"] = {}
-    return _wm_state["data"]
-
-
-WM_FAMILY_EQ = ("Is", "IsNot", "Eq", "NotEq")
-WM_FAMILY_ORD = ("Lt", "LtE", "Gt", "GtE", "Eq", "NotEq")
-
-
-def find_single_compare_swap(old_node, new_node):
-    old_cmps = [n for n in ast.walk(old_node) if isinstance(n, ast.Compare) and len(n.ops) == 1]
-    new_cmps = [n for n in ast.walk(new_node) if isinstance(n, ast.Compare) and len(n.ops) == 1]
-    if len(old_cmps) != 1 or len(new_cmps) != 1:
-        return None
-    o, n = old_cmps[0], new_cmps[0]
-    old_op = type(o.ops[0]).__name__
-    new_op = type(n.ops[0]).__name__
-    if old_op == new_op:
-        return None
-    if ast.dump(o.left) != ast.dump(n.left) or len(o.comparators) != len(n.comparators):
-        return None
-    if any(ast.dump(c1) != ast.dump(c2) for c1, c2 in zip(o.comparators, n.comparators)):
-        return None
-    class Repl(ast.NodeTransformer):
-        def visit_Compare(self, node):
-            if ast.dump(node) == ast.dump(n):
-                return ast.Compare(left=node.left, ops=o.ops, comparators=node.comparators)
-            return node
-    modified_new = Repl().visit(copy.deepcopy(new_node))
-    if _norm(old_node) != _norm(modified_new):
-        return None
-    key = f"{o.lineno}:{o.col_offset}:{o.end_lineno}:{o.end_col_offset}"
-    return key, old_op, new_op
-
-
-def wm_tests(sel, rel: str, key: str, old_op: str, new_op: str) -> set | None:
-    W = wm_data(sel)
-    if not W:
-        return None
-    site = W.get("sites", {}).get(rel, {}).get(key)
-    if site is None or site[0] != old_op:
-        return None
-    fam = WM_FAMILY_ORD if old_op in ("Lt", "LtE", "Gt", "GtE") else WM_FAMILY_EQ
-    if old_op not in WM_FAMILY_ORD + WM_FAMILY_EQ or new_op not in fam or new_op == old_op:
-        return None
-    for d in W.get("modules", {}).values():
-        if new_op in d.get(rel, {}).get(key, ()):
-            return None
-    out = set()
-    sid = site[1].get(new_op)
-    if sid is not None:
-        nums = W["_nums"]
-        out.update(nums[i] for i in W["sets"][sid] if nums[i] is not None)
-    return out
 
 
 def _is_def_line(line, name):
@@ -1124,6 +1236,7 @@ def import_diff(sel):
     if only:
         keys = {k for k in keys if _key_module(k) in only or k in REGISTRY_KEYS}
     changed = [k for k in keys if pinned.get(k) != new.get(k)]
+    sel.imp_changed = bool(changed)
     out = set()
     for k in changed:
         if k.endswith(".__mro__") or k.endswith(".__members__"):
@@ -1477,6 +1590,8 @@ def main():
                 chosen |= r
             if chosen is not ALL and sel.need_imp:
                 r = import_diff(sel)
+                if r is ALL or sel.imp_changed:
+                    sel.swap_ok = False  # import-time state differs: a code swap can't reproduce it
                 if r is ALL:
                     chosen = ALL
                 else:
@@ -1548,6 +1663,14 @@ def main():
             sel.reset()
         log(cid, "selected", len(chosen))
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    p = _vstate.get("proc")
+    if p is not None:  # let the verifier exit (and be accounted for) cleanly
+        try:
+            p.stdin.close()
+            p.wait(timeout=10)
+        except Exception:
+            p.kill()
 
 
 if __name__ == "__main__":
