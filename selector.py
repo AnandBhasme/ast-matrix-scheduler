@@ -941,7 +941,46 @@ def _tmp(name):
 
 
 IMP_PINNED = Path(os.environ.get("IMP_PINNED", APP / "imp_pinned.json"))
-_imp_state = {"pinned": None}
+IMP_GRAPH = Path(os.environ.get("IMP_GRAPH", APP / "imports.json"))
+_imp_state = {"pinned": None, "rdeps": None}
+REGISTRY_KEYS = frozenset({
+    "sqlglot.dialects.dialect:_Dialect._classes",
+    "sqlglot.optimizer.annotate_types::_COERCES_TO",
+    "sqlglot.optimizer.annotate_types:TypeAnnotator.COERCES_TO",
+})  # must match impdiff.REGISTRY_KEYS
+
+
+def _key_module(k):
+    return k.split("::", 1)[0] if "::" in k else k.split(":", 1)[0]
+
+
+def affected_modules(rels):
+    """Patched modules plus every module that (transitively) imports one of them:
+    the only modules whose import-time state a patch can change (besides the
+    registries in REGISTRY_KEYS). None = everything."""
+    try:
+        if _imp_state["rdeps"] is None:
+            graph = json.load(open(IMP_GRAPH))
+            rdeps = {}
+            for m, deps in graph.items():
+                for d in deps:
+                    rdeps.setdefault(d, set()).add(m)
+            _imp_state["rdeps"] = rdeps
+    except Exception:
+        return None
+    rdeps = _imp_state["rdeps"]
+    todo = []
+    for rel in rels:
+        m = rel[:-3].replace("/", ".")
+        todo.append(m[: -len(".__init__")] if m.endswith(".__init__") else m)
+    seen = set(todo)
+    while todo:
+        m = todo.pop()
+        for r in rdeps.get(m, ()):
+            if r not in seen:
+                seen.add(r)
+                todo.append(r)
+    return None if len(seen) > 120 else seen
 _t_start = None
 
 
@@ -977,7 +1016,9 @@ def import_diff(sel):
     try:
         make_tree(sel, root)
         env = dict(os.environ, PYTHONPATH=str(root), PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1")
-        r = subprocess.run([sys.executable, str(APP / "impdiff.py"), "dump", str(out_file)], env=env,
+        only = affected_modules(sel.patched)
+        r = subprocess.run([sys.executable, str(APP / "impdiff.py"), "dump", str(out_file),
+                            ",".join(sorted(only)) if only else ""], env=env,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
         if r.returncode != 0:
             log("  import diff: patched import failed")
@@ -993,7 +1034,10 @@ def import_diff(sel):
             os.unlink(out_file)
         except OSError:
             pass
-    changed = [k for k in set(pinned) | set(new) if pinned.get(k) != new.get(k)]
+    keys = set(pinned) | set(new)
+    if only:
+        keys = {k for k in keys if _key_module(k) in only or k in REGISTRY_KEYS}
+    changed = [k for k in keys if pinned.get(k) != new.get(k)]
     out = set()
     for k in changed:
         if k.endswith(".__mro__") or k.endswith(".__members__"):

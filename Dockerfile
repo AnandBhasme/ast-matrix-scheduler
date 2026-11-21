@@ -24,6 +24,7 @@ RUN cd /app && export PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 TESTS_ROOT=/app
     && python replay.py fingerprint tpch /app/fp_tpch.json \
     && python replay.py fingerprint tpcds /app/fp_tpcds.json \
     && python impdiff.py dump /app/imp_pinned.json \
+    && python impdiff.py graph /app/src /app/imports.json \
     && chmod -R a+rX /app
 
 ENV PYTHONDONTWRITEBYTECODE=1
