@@ -31,6 +31,20 @@ _SKIP_CLASS_TYPES = (
 )
 
 
+def kr(k):
+    """Canonical dict-entry key representation (must match tools/brattr.py)."""
+    t = type(k)
+    if k is None or t in (bool, int, float, str, bytes):
+        return f"{t.__name__}:{k!r}"
+    if isinstance(k, enum.Enum):
+        return f"E:{t.__module__}.{t.__qualname__}.{k.name}"
+    if isinstance(k, type):
+        return f"T:{k.__module__}.{k.__qualname__}"
+    if t is tuple:
+        return "t(" + ",".join(kr(x) for x in k) + ")"
+    return None
+
+
 def _named_ref(fn):
     """'module.qualname' if fn is the object found at that path, else None
     (closures, lambdas, decorated wrappers)."""
@@ -99,7 +113,10 @@ class FP:
             # (id-hashed), so their insertion order differs from run to run
             return f"{t.__name__}{{" + ",".join(sorted(f"{f(a, d)}:{f(b, d)}" for a, b in v.items())) + "}"
         if isinstance(v, types.FunctionType):
-            parts = [v.__qualname__, self.code(v.__code__, d)]
+            # No bytecode: what a function's *code* does is the job of statement
+            # coverage (its lines run at test time, or at import time and then show
+            # up in derived values). Only import-time *data* bound to it counts here.
+            parts = [v.__qualname__, ",".join(v.__code__.co_varnames[: v.__code__.co_argcount])]
             if v.__defaults__:
                 parts.append(f(v.__defaults__, d))
             if v.__kwdefaults__:
@@ -165,6 +182,7 @@ def dump():
         mods.append(importlib.import_module(m.name))
     fp = FP()
     out = {}
+    ent = {}  # dict-valued class attributes: key -> {entry key: fingerprint}
     seen = set()
     for mod in mods:
         for name, val in list(vars(mod).items()):
@@ -206,8 +224,19 @@ def dump():
                         continue
                     if hasattr(type(val), "__get__"):
                         continue
-                    out[f"{c.__module__}:{c.__qualname__}.{name}"] = fp(val)
-    return out
+                    k = f"{c.__module__}:{c.__qualname__}.{name}"
+                    out[k] = fp(val)
+                    if type(val) is dict:
+                        e = {}
+                        for a, b in val.items():
+                            ka = kr(a)
+                            if ka is None:
+                                e = None
+                                break
+                            e[ka] = fp(b)
+                        if e is not None:
+                            ent[k] = e
+    return {"fp": out, "ent": ent}
 
 
 def main():

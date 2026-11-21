@@ -211,6 +211,9 @@ class Selector:
         self.imp = m["imp"]
         self.fix = m["fix"]
         self.attr = m["attr"]
+        self.kattr = m.get("kattr", {})
+        self.pcov = m.get("pcov", {})
+        self.nonp = {int(n): {f: set(ls) for f, ls in d.items()} for n, d in m.get("nonp", {}).items()}
         self.attr_by_name = {}
         for k, v in self.attr.items():
             self.attr_by_name.setdefault(k.rsplit(".", 1)[1], []).append(v)
@@ -244,6 +247,7 @@ class Selector:
         self.spans = []  # (file, start, end) whose statement-coverage selected tests
         self.span_tests = set()
         self.other_tests = set()  # tests selected by any other rule
+        self.spare = set()  # pruned by a finer rule: packed into idle worker time for free
         self.patched = {}  # rel -> patched source
         self.need_imp = False
 
@@ -345,6 +349,7 @@ class Selector:
                 if n is not None:
                     keep.add(n)
         log(f"  tpc fixture {rel}: {len(out)} -> {len(keep)} tests")
+        self.spare |= out - keep
         return keep
 
     def ids_of(self, n):
@@ -403,6 +408,7 @@ class Selector:
             log("  apply failed", rel)
             return ALL
         self.patched[rel] = new
+        self._pairs = _line_pairs(hunks)
         if re.search(r"^[ \t\f]*#.*?coding[:=]", "\n".join(new.split("\n")[:2]), re.M):
             return ALL
         try:
@@ -488,6 +494,15 @@ class Selector:
                     return ALL if self._decorator_is_import_time(node) else out
                 continue
             # module or class level statement (executed at import time)
+            lam = self.lambda_body_edit(idx, c) if kind != "ins" else None
+            if lam is not None:
+                # edit confined to a lambda's body (e.g. a TRANSFORMS entry): the body
+                # runs only when the lambda is called, so its test-time line coverage
+                # is exact; the import diff still catches import-time calls/failures
+                log(f"  lambda body edit {rel}:{lam.lineno}-{lam.end_lineno}")
+                out |= self.cov_span(rel, lam.lineno, lam.end_lineno)
+                self.defer_import()
+                continue
             if kind == "ins":
                 r = self.level_insert(rel, module, idx, new_idx, ln, chain)
             else:
@@ -549,11 +564,8 @@ class Selector:
         if qual and isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             names = _target_names(node)
             out = set()
-            for n in names:
-                t = self.attr_tests(module, qual, n)
-                if t is not None:
-                    out |= t
-            # Always confirm through the import diff: the attribute may be read while
+            # The tests come from the import diff (changed keys / dict entries -> their
+            # test-time readers). Always confirm through the import diff: the attribute may be read while
             # sqlglot itself is imported (before the read tracer was installed), which
             # can change derived state or even make the import fail.
             log(f"  class attr {qual}.{names} -> {len(out)} tests + import diff")
@@ -565,6 +577,31 @@ class Selector:
             return set() if r is ALL else r
         # class header, decorators, other module/class level statements
         return self.defer_import()
+
+    def lambda_body_edit(self, idx, ln):
+        """The innermost lambda whose *body* contains the whole edit on old line ln
+        (single-line replacement), else None."""
+        pair = getattr(self, "_pairs", {}).get(ln)
+        if pair is None:
+            return None
+        old, new = pair
+        p = 0
+        while p < min(len(old), len(new)) and old[p] == new[p]:
+            p += 1
+        q = 0
+        while q < min(len(old), len(new)) - p and old[-1 - q] == new[-1 - q]:
+            q += 1
+        a = len(old[:p].encode())  # ast columns are UTF-8 byte offsets
+        b = len(old[: len(old) - q].encode())
+        best = None
+        for node in ast.walk(idx.tree):
+            if not isinstance(node, ast.Lambda):
+                continue
+            body = node.body
+            if (body.lineno, body.col_offset) <= (ln, a) and (ln, b) <= (body.end_lineno, body.end_col_offset):
+                if best is None or (node.lineno, node.col_offset) >= (best.lineno, best.col_offset):
+                    best = node
+        return best
 
     def runs_at_import(self, rel, s, e):
         lines = self._imp_sets.get(rel)
@@ -719,6 +756,35 @@ def _fixture_pairs(text):
     return out
 
 
+def _line_pairs(hunks):
+    """old line number -> (old text, new text) for '-' runs replaced by an equally
+    long '+' run."""
+    pairs = {}
+    for os_, ol, ns, nl, body in hunks:
+        pos = os_
+        i = 0
+        while i < len(body):
+            if body[i][0] == " ":
+                pos += 1
+                i += 1
+                continue
+            j = i
+            dels = []
+            while j < len(body) and body[j][0] == "-":
+                dels.append(body[j][1])
+                j += 1
+            adds = []
+            while j < len(body) and body[j][0] == "+":
+                adds.append(body[j][1])
+                j += 1
+            if dels and len(dels) == len(adds):
+                for k, (o, n) in enumerate(zip(dels, adds)):
+                    pairs[pos + k] = (o, n)
+            pos += len(dels)
+            i = j if j > i else i + 1
+    return pairs
+
+
 def _qualname(path, upto):
     parts = []
     for a in path:
@@ -813,6 +879,27 @@ def _target_names(node):
 # --------------------------------------------------------------------------- partition
 
 
+def SPARE_ALWAYS_IDS(sel):
+    """Tests worth running whenever there is idle capacity: timing/memory sensitive
+    tests whose outcome can be noisy."""
+    ids = ("tests/test_generator.py::TestGenerator::test_generator_memory",)
+    return {sel.by_id[i] for i in ids if i in sel.by_id}
+
+
+def fill_slack(workers, spare, ms):
+    """Add spare tests to workers below the busiest load, never raising it and never
+    adding a worker: the simulated cost is unchanged."""
+    loads = [sum(ms[n] for n in w) for w in workers]
+    top = max(loads)
+    workers = [list(w) for w in workers]
+    for n in sorted(spare, key=lambda n: (-ms[n], n)):
+        j = min(range(len(workers)), key=loads.__getitem__)
+        if loads[j] + ms[n] <= top:
+            workers[j].append(n)
+            loads[j] += ms[n]
+    return workers
+
+
 def partition(nums, ms, max_workers=8):
     if not nums:
         return []
@@ -883,7 +970,8 @@ def import_diff(sel):
         return ALL
     if _imp_state["pinned"] is None:
         _imp_state["pinned"] = json.load(open(IMP_PINNED))
-    pinned = _imp_state["pinned"]
+    pinned_all = _imp_state["pinned"]
+    pinned, pinned_ent = pinned_all["fp"], pinned_all["ent"]
     root = _tmp("br_imp")
     out_file = _tmp("br_imp.json")
     try:
@@ -894,7 +982,8 @@ def import_diff(sel):
         if r.returncode != 0:
             log("  import diff: patched import failed")
             return ALL
-        new = json.load(open(out_file))
+        new_all = json.load(open(out_file))
+        new, new_ent = new_all["fp"], new_all["ent"]
     except Exception as e:
         log(f"  import diff error {e!r}")
         return ALL
@@ -921,6 +1010,22 @@ def import_diff(sel):
                 return ALL
             out |= t
         else:
+            ka = sel.kattr.get(k)
+            if ka is not None and k in pinned_ent and k in new_ent:
+                # dict attribute: only tests that read a changed entry (or the whole dict)
+                po, pn = pinned_ent[k], new_ent[k]
+                changed_entries = [e for e in set(po) | set(pn) if po.get(e) != pn.get(e)]
+                t = set(sel.sets[ka["*"]])
+                for e in changed_entries:
+                    j = ka["k"].get(e)
+                    if j is not None:
+                        t.update(sel.sets[j])
+                t.discard(-1)  # import-time readers: their effect shows up as other changed keys
+                if k in sel.attr:
+                    sel.spare.update(x for x in sel.sets[sel.attr[k]] if x >= 0)
+                log(f"  import diff: {k} entries {changed_entries[:3]} -> {len(t)} tests")
+                out |= t
+                continue
             i = sel.attr.get(k)
             if i is None:
                 if k not in pinned:
@@ -1027,7 +1132,90 @@ def replay_prune(sel, chosen, ms, cid):
             f"saving={saving:.1f}s -> {'identical, drop' if same else 'differs, keep'}")
         if same:
             chosen = chosen - {target}
+            sel.spare.add(target)
     return chosen
+
+
+CASES = Path(os.environ.get("CASES_FILE", APP / "cases.pkl.gz"))
+_cstate = {"fp": None}
+
+
+def case_prune(sel, chosen, ms, cid):
+    """Drop check_file-based optimizer tests whose changed lines run only inside
+    specific fixture cases, when replaying those cases gives identical results."""
+    import subprocess
+    import time
+
+    if not sel.patched or not sel.pcov:
+        return chosen
+    if _cstate["fp"] is None:
+        _cstate["fp"] = json.load(open(FP_DIR / "fp_cases.json"))
+    fps = _cstate["fp"]
+    spec = {}
+    for n in sorted(chosen):
+        tid = sel.ids_of(n)
+        if tid not in fps or n in sel.other_tests or n not in sel.span_tests:
+            continue
+        nonp = sel.nonp.get(n, {})
+        bits = 0
+        ok = True
+        for rel, s, e in sel.spans:
+            fc = sel.cov.get(rel, {})
+            pc = sel.pcov.get(rel, {})
+            np_ = nonp.get(rel, ())
+            for ln in range(s, e + 1):
+                i = fc.get(str(ln))
+                if i is None or n not in sel.sets[i]:
+                    continue
+                b = pc.get(str(ln), {}).get(str(n))
+                if ln in np_ or b is None:
+                    ok = False  # runs outside the replayable cases
+                    break
+                bits |= int(b, 16)
+            if not ok:
+                break
+        if ok and bits:
+            spec[tid] = [k for k in range(bits.bit_length()) if bits >> k & 1]
+    if not spec:
+        return chosen
+    cand = {sel.by_id[t] for t in spec}
+    saving = (_cost(chosen, ms) - _cost(chosen - cand, ms)) / 1000
+    est = 0.6 + sum(fps[t]["secs"][k] for t, ks in spec.items() for k in ks)
+    if est * 1.25 + 0.2 >= saving or est * 1.5 > time_left():
+        log(f"  case replay: skip {len(spec)} tests est={est:.1f}s saving={saving:.1f}s")
+        return chosen
+    root = _tmp("br_cases")
+    spec_file = _tmp("br_cases.json")
+    t0 = time.time()
+    try:
+        make_tree(sel, root)
+        with open(spec_file, "w") as f:
+            json.dump(spec, f)
+        env = dict(os.environ, PYTHONPATH=str(root), TESTS_ROOT=str(SRC), PYTHONHASHSEED="0",
+                   PYTHONDONTWRITEBYTECODE="1")
+        cap = max(est, min(0.6 * saving, time_left() / 1.5))
+        r = subprocess.run(
+            [sys.executable, str(APP / "casereplay.py"), "check", str(CASES), str(FP_DIR / "fp_cases.json"),
+             str(spec_file), f"{cap:.1f}"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=cap + 15.0,
+        )
+        same = json.loads(r.stdout.decode() or "[]") if r.returncode == 0 else []
+    except Exception as e:
+        log(f"  case replay error {e!r}")
+        same = []
+    finally:
+        import shutil
+
+        shutil.rmtree(root, ignore_errors=True)
+        try:
+            os.unlink(spec_file)
+        except OSError:
+            pass
+    drop = {sel.by_id[t] for t in same if t in sel.by_id}
+    log(f"  case replay: {sum(map(len, spec.values()))} cases of {len(spec)} tests est={est:.1f}s "
+        f"took={time.time()-t0:.1f}s saving={saving:.1f}s -> drop {len(drop)}")
+    sel.spare |= drop
+    return chosen - drop
 
 
 def main():
@@ -1112,13 +1300,21 @@ def main():
                 chosen = replay_prune(sel, chosen, ms, cid)
             except Exception as e:  # never let replay break a commit
                 print(f"{cid}: replay error {e!r}", file=sys.stderr)
-        if sel is not None:
-            # NOTE: no "soak-test quarantine". Dropping test_max_nodes /
-            # test_generator_memory unconditionally is unsound: test_max_nodes also
-            # asserts that ordinary queries parse, so it fails whenever basic parsing or
-            # the import breaks (verified on a tokenizer_core.py mutant: 300 s miss).
-            sel.reset()
+            if os.environ.get("BR_CASES") == "1":  # off: measured CPU > saving
+                try:
+                    chosen = case_prune(sel, chosen, ms, cid)
+                except Exception as e:
+                    print(f"{cid}: case replay error {e!r}", file=sys.stderr)
+        # NOTE: no "soak-test quarantine". Dropping test_max_nodes /
+        # test_generator_memory unconditionally is unsound: test_max_nodes also
+        # asserts that ordinary queries parse, so it fails whenever basic parsing or
+        # the import breaks (verified on a tokenizer_core.py mutant: 300 s miss).
         workers = partition(sorted(chosen), ms)
+        if sel is not None:
+            if workers:
+                spare = (sel.spare | SPARE_ALWAYS_IDS(sel)) - chosen
+                workers = fill_slack(workers, {n for n in spare if n in ms}, ms)
+            sel.reset()
         log(cid, "selected", len(chosen))
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")) + "\n")
 
