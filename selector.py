@@ -11,6 +11,7 @@ changed statements located with the ast module.
 from __future__ import annotations
 
 import ast
+import copy
 import gzip
 import json
 import os
@@ -22,6 +23,7 @@ DATA = Path(os.environ.get("DATA_DIR", "/data"))
 APP = Path(__file__).resolve().parent
 SRC = Path(os.environ.get("SRC_DIR", APP / "src"))
 MAP = Path(os.environ.get("MAP_FILE", APP / "map.json.gz"))
+WM_PATH = Path(os.environ.get("WM_FILE", APP / "wm.json.gz"))
 DEBUG = os.environ.get("BR_DEBUG") == "1"
 
 ALL = "ALL"  # sentinel: run everything
@@ -250,6 +252,7 @@ class Selector:
         self.spare = set()  # pruned by a finer rule: packed into idle worker time for free
         self.patched = {}  # rel -> patched source
         self.need_imp = False
+        self.swap_ok = True  # every change is a function-body edit (code hot-swap safe)
 
     # ---- coverage lookups
     def cov_span(self, rel, s, e, replayable=True):
@@ -476,9 +479,20 @@ class Selector:
                     fs = scope.lineno
                     out |= self.cov_span(rel, fs, scope.end_lineno)
                 else:
+                    hit_new = new_idx.innermost(c)
+                    swap = find_single_compare_swap(node, hit_new[2]) if hit_new else None
+                    if swap:
+                        t = wm_tests(self, rel, swap[0], swap[1], swap[2])
+                        if t is not None:
+                            log(f"  wm swap {rel} {swap[0]} {swap[1]}->{swap[2]}: {len(t)} tests")
+                            W = wm_data(self)
+                            inc = (W.get("_incomplete", set()) if W else set()) & self.cov_span(rel, s, e)
+                            out |= (t | inc)
+                            continue
                     out |= self.cov_span(rel, s, e)
                 continue
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.swap_ok = False  # def header / decorator / defaults
                 # def header / decorator / defaults (or insertion right at def line)
                 if kind == "ins" and c == ln - 1 and c == node.end_lineno:
                     # inserting after a function: new module/class level statement
@@ -613,6 +627,7 @@ class Selector:
         """The change only acts through import-time state: resolve it after all files
         are seen, by diffing the patched import against the pinned one."""
         self.need_imp = True
+        self.swap_ok = False
         return set()
 
     def level_insert(self, rel, module, idx, new_idx, ln, chain):
@@ -858,6 +873,77 @@ class _Equiv(ast.NodeTransformer):
 
 def _norm_list(xs):
     return tuple(_norm(x) for x in xs)
+
+
+_wm_state = {"data": None}
+
+
+def wm_data(sel):
+    if _wm_state["data"] is None:
+        if WM_PATH.is_file():
+            try:
+                with gzip.open(WM_PATH, "rt") as f:
+                    d = json.load(f)
+                nums = [sel.by_id.get(i) for i in d["tests"]]
+                d["_nums"] = nums
+                d["_incomplete"] = {nums[i] for i in d["incomplete"] if nums[i] is not None}
+                _wm_state["data"] = d
+            except Exception:
+                _wm_state["data"] = {}
+        else:
+            _wm_state["data"] = {}
+    return _wm_state["data"]
+
+
+WM_FAMILY_EQ = ("Is", "IsNot", "Eq", "NotEq")
+WM_FAMILY_ORD = ("Lt", "LtE", "Gt", "GtE", "Eq", "NotEq")
+
+
+def find_single_compare_swap(old_node, new_node):
+    old_cmps = [n for n in ast.walk(old_node) if isinstance(n, ast.Compare) and len(n.ops) == 1]
+    new_cmps = [n for n in ast.walk(new_node) if isinstance(n, ast.Compare) and len(n.ops) == 1]
+    if len(old_cmps) != 1 or len(new_cmps) != 1:
+        return None
+    o, n = old_cmps[0], new_cmps[0]
+    old_op = type(o.ops[0]).__name__
+    new_op = type(n.ops[0]).__name__
+    if old_op == new_op:
+        return None
+    if ast.dump(o.left) != ast.dump(n.left) or len(o.comparators) != len(n.comparators):
+        return None
+    if any(ast.dump(c1) != ast.dump(c2) for c1, c2 in zip(o.comparators, n.comparators)):
+        return None
+    class Repl(ast.NodeTransformer):
+        def visit_Compare(self, node):
+            if ast.dump(node) == ast.dump(n):
+                return ast.Compare(left=node.left, ops=o.ops, comparators=node.comparators)
+            return node
+    modified_new = Repl().visit(copy.deepcopy(new_node))
+    if _norm(old_node) != _norm(modified_new):
+        return None
+    key = f"{o.lineno}:{o.col_offset}:{o.end_lineno}:{o.end_col_offset}"
+    return key, old_op, new_op
+
+
+def wm_tests(sel, rel: str, key: str, old_op: str, new_op: str) -> set | None:
+    W = wm_data(sel)
+    if not W:
+        return None
+    site = W.get("sites", {}).get(rel, {}).get(key)
+    if site is None or site[0] != old_op:
+        return None
+    fam = WM_FAMILY_ORD if old_op in ("Lt", "LtE", "Gt", "GtE") else WM_FAMILY_EQ
+    if old_op not in WM_FAMILY_ORD + WM_FAMILY_EQ or new_op not in fam or new_op == old_op:
+        return None
+    for d in W.get("modules", {}).values():
+        if new_op in d.get(rel, {}).get(key, ()):
+            return None
+    out = set()
+    sid = site[1].get(new_op)
+    if sid is not None:
+        nums = W["_nums"]
+        out.update(nums[i] for i in W["sets"][sid] if nums[i] is not None)
+    return out
 
 
 def _is_def_line(line, name):
@@ -1180,6 +1266,101 @@ def replay_prune(sel, chosen, ms, cid):
     return chosen
 
 
+# --------------------------------------------------------------------------- verification
+
+VERIFY = os.environ.get("BR_VERIFY", "1") != "0"
+VERIFY_ALL = os.environ.get("BR_VERIFY_ALL") == "1"  # local fidelity checks only
+# never verified (kept if selected): timing / memory sensitive or process-level tests
+NO_VERIFY = (
+    "tests/test_generator.py::TestGenerator::test_generator_memory",
+    "tests/test_parser.py::TestParser::test_max_nodes",
+)
+NO_VERIFY_FILES = ("tests/test_docs.py", "tests/test_sqlglotc.py", "tests/test_dialect_imports.py",
+                   "tests/test_dialect_entry_points.py", "tests/test_build.py")
+_vstate = {"proc": None, "dead": False}
+
+
+def _verifier():
+    import select
+    import subprocess
+
+    st = _vstate
+    if st["dead"]:
+        return None
+    if st["proc"] is None:
+        env = dict(os.environ, SRC_DIR=str(SRC), SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1")
+        env.pop("PYTHONPATH", None)
+        try:
+            p = subprocess.Popen([sys.executable, str(APP / "verifier.py")], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+            r, _, _ = select.select([p.stdout], [], [], 40)
+            if not r or not json.loads(p.stdout.readline() or b"{}").get("ready"):
+                raise RuntimeError("verifier not ready")
+        except Exception as e:
+            log(f"  verifier unavailable: {e!r}")
+            st["dead"] = True
+            return None
+        st["proc"] = p
+    return st["proc"]
+
+
+def verify_prune(sel, chosen, ms, cid):
+    """Run small, cheap selected tests against the patched code (hot-swapped into a
+    warm interpreter) and drop the ones that pass."""
+    import select
+    import time
+
+    if not VERIFY or not sel.swap_ok or not sel.patched or not chosen:
+        return chosen
+    cand = []
+    run = 0.0
+    for n in sorted(chosen, key=lambda n: (ms[n], n)):
+        tid = sel.ids_of(n)
+        if tid in NO_VERIFY or tid.split("::")[0] in NO_VERIFY_FILES:
+            continue
+        if not VERIFY_ALL and (ms[n] > 200 or run + ms[n] / 1000 > 1.0):
+            break
+        cand.append(n)
+        run += ms[n] / 1000
+    if not cand:
+        return chosen
+    saving = (_cost(chosen, ms) - _cost(chosen - set(cand), ms)) / 1000
+    if not VERIFY_ALL and (saving - run - 0.15 < 1.0 or 3 * run + 2 > time_left()):
+        log(f"  verify: skip {len(cand)} tests run={run:.2f}s saving={saving:.1f}s")
+        return chosen
+    p = _verifier()
+    if p is None:
+        return chosen
+    t0 = time.time()
+    req = {"files": dict(sel.patched), "tests": [sel.ids_of(n) for n in cand], "timeout": 3 * run + 5}
+    stalled = False
+    try:
+        p.stdin.write((json.dumps(req) + "\n").encode())
+        p.stdin.flush()
+        ready, _, _ = select.select([p.stdout], [], [], req["timeout"] + 10)
+        if ready:
+            rep = json.loads(p.stdout.readline())
+        else:
+            stalled, rep = True, {"ok": False, "err": "zygote stalled"}
+    except Exception as e:
+        stalled, rep = True, {"ok": False, "err": repr(e)}
+    if stalled:
+        _vstate["dead"] = True
+        try:
+            p.kill()
+        except Exception:
+            pass
+    if not rep.get("ok"):
+        log(f"  verify: could not verify ({rep.get('err', '')}) took={time.time()-t0:.2f}s")
+        return chosen
+    failed = {sel.by_id[t] for t in rep.get("failed", []) if t in sel.by_id}
+    passed = set(cand) - failed
+    log(f"  verify: {len(cand)} tests run={run:.2f}s took={time.time()-t0:.2f}s "
+        f"saving<={saving:.1f}s -> {len(passed)} pass, {len(failed)} fail")
+    sel.spare |= passed
+    return chosen - passed
+
+
 CASES = Path(os.environ.get("CASES_FILE", APP / "cases.pkl.gz"))
 _cstate = {"fp": None}
 
@@ -1344,6 +1525,12 @@ def main():
                 chosen = replay_prune(sel, chosen, ms, cid)
             except Exception as e:  # never let replay break a commit
                 print(f"{cid}: replay error {e!r}", file=sys.stderr)
+            try:
+                if all((f["new"] or "").startswith("sqlglot/") and (f["new"] or "").endswith(".py")
+                       and f["old"] == f["new"] for f in files):
+                    chosen = verify_prune(sel, chosen, ms, cid)
+            except Exception as e:
+                print(f"{cid}: verify error {e!r}", file=sys.stderr)
             if os.environ.get("BR_CASES") == "1":  # off: measured CPU > saving
                 try:
                     chosen = case_prune(sel, chosen, ms, cid)

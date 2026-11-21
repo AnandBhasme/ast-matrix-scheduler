@@ -17,6 +17,8 @@ sample/
 # Internal scratch tools and agent collaboration log (stays local only)
 progress.md
 tools/
+casereplay.py
+cases.pkl.gz
 
 # Docker build artifacts
 .dockerignore.swp
