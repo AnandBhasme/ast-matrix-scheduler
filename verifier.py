@@ -85,11 +85,22 @@ def _codes(co, out):
     return out
 
 
+_PRISTINE = {}  # rel -> (source, code objects by qualname); filled in the zygote
+
+
+def pristine(rel):
+    r = _PRISTINE.get(rel)
+    if r is None:
+        path = os.path.join(SRC, rel)
+        with io.open_code(path) as fh:  # never an overlay: always the pristine file
+            src = fh.read().decode("utf-8")
+        r = _PRISTINE[rel] = (src, _codes(compile(src, path, "exec"), {}))
+    return r
+
+
 def swap(rel, new_src):
     path = os.path.join(SRC, rel)
-    with io.open_code(path) as fh:  # never an overlay: always the pristine file
-        old_src = fh.read().decode("utf-8")
-    old = _codes(compile(old_src, path, "exec"), {})
+    old_src, old = pristine(rel)
     new = _codes(compile(new_src, path, "exec"), {})
     if set(old) != set(new) or any(len(old[q]) != len(new[q]) for q in old):
         raise Unswappable("code structure changed")
@@ -240,6 +251,12 @@ def run_failfast(ids):
 
 
 def handle(req):
+    if req.get("mode") != "reimport":
+        for rel in req.get("files", {}):
+            try:
+                pristine(rel)  # compiled once here, inherited by every forked child
+            except Exception:
+                pass
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:  # child
