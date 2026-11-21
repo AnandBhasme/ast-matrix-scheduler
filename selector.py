@@ -215,6 +215,8 @@ class Selector:
         for k, v in self.attr.items():
             self.attr_by_name.setdefault(k.rsplit(".", 1)[1], []).append(v)
         self._src = {}
+        self._imp_sets = {}
+        self.reset()
         self._idx = {}
         self._names = None
 
@@ -237,14 +239,25 @@ class Selector:
                 self._idx[rel] = None
         return self._idx[rel]
 
+    def reset(self):
+        """Per-commit state used by the differential replay."""
+        self.spans = []  # (file, start, end) whose statement-coverage selected tests
+        self.span_tests = set()
+        self.other_tests = set()  # tests selected by any other rule
+        self.patched = {}  # rel -> patched source
+        self.need_imp = False
+
     # ---- coverage lookups
-    def cov_span(self, rel, s, e):
+    def cov_span(self, rel, s, e, replayable=True):
         fc = self.cov.get(rel, {})
         out = set()
         for ln in range(s, e + 1):
             i = fc.get(str(ln))
             if i is not None:
                 out.update(self.sets[i])
+        if replayable:
+            self.spans.append((rel, s, e))
+            self.span_tests |= out
         return out
 
     def attr_tests(self, module, qual, name):
@@ -254,6 +267,7 @@ class Selector:
         s = self.sets[i]
         if -1 in s:
             return None  # read at import time (metaclass etc): effect not attributable
+        self.other_tests.update(s)
         return set(s)
 
     # ---- per file
@@ -272,9 +286,15 @@ class Selector:
         if path.startswith("sqlglot/") and path.endswith(".py"):
             return self.select_sqlglot_py(path, f["hunks"])
         if path.startswith("tests/") and path.endswith(".py"):
-            return self.select_test_py(path, f["hunks"])
+            r = self.select_test_py(path, f["hunks"])
+            if r is not ALL:
+                self.other_tests |= r
+            return r
         if path.startswith("tests/"):
-            return self.select_fixture(path, f["hunks"])
+            r = self.select_fixture(path, f["hunks"])
+            if r is not ALL:
+                self.other_tests |= r
+            return r
         if path.startswith("sqlglot/"):
             return ALL  # non-python package data
         return set()  # docs, README, CHANGELOG, posts, benchmarks ...
@@ -302,7 +322,35 @@ class Selector:
         if -1 in s:
             log("  fixture opened at import", rel)
             return ALL
-        return set(s)
+        out = set(s)
+        spec = TPC_FIXTURES.get(rel)
+        if spec is not None:
+            out = self.tpc_fixture(rel, src, new, out, spec)
+        return out
+
+    def tpc_fixture(self, rel, src, new, out, spec):
+        """TestExecutor.setUpClass loads the TPC fixtures for the whole class, so the
+        fixture map charges every executor test; only the tests listed in TPC_FIXTURES
+        read them, and only the listed fields of each (meta, sql, expected) pair."""
+        try:
+            old_pairs, new_pairs = _fixture_pairs(src), _fixture_pairs(new)
+        except Exception:
+            return out
+        prefix = spec["class"] + "::"
+        keep = {n for n in out if not self.ids_of(n).startswith(prefix)}
+        for test_id, fields in spec["consumers"].items():
+            proj = lambda pairs: [tuple(p[f] for f in fields) for p in pairs]  # noqa: E731
+            if len(old_pairs) != len(new_pairs) or proj(old_pairs) != proj(new_pairs):
+                n = self.by_id.get(test_id)
+                if n is not None:
+                    keep.add(n)
+        log(f"  tpc fixture {rel}: {len(out)} -> {len(keep)} tests")
+        return keep
+
+    def ids_of(self, n):
+        if not hasattr(self, "_id_by_num"):
+            self._id_by_num = {v: k for k, v in self.by_id.items()}
+        return self._id_by_num.get(n, "")
 
     def select_test_py(self, rel, hunks):
         try:
@@ -354,6 +402,7 @@ class Selector:
         except ValueError:
             log("  apply failed", rel)
             return ALL
+        self.patched[rel] = new
         if re.search(r"^[ \t\f]*#.*?coding[:=]", "\n".join(new.split("\n")[:2]), re.M):
             return ALL
         try:
@@ -413,6 +462,9 @@ class Selector:
                     break
             if scope is not None and scope is not node:
                 # inside a function body
+                if self.runs_at_import(rel, s, e):
+                    log(f"  {rel}:{s}-{e} runs at import time -> import diff")
+                    self.defer_import()
                 if kind == "ins":
                     # inserted statement: anything that ran the enclosing function
                     fs = scope.lineno
@@ -429,6 +481,8 @@ class Selector:
                         return ALL
                     out |= r
                     continue
+                if self.runs_at_import(rel, node.lineno + 1, node.end_lineno):
+                    self.defer_import()
                 out |= self.cov_span(rel, node.lineno, node.end_lineno)
                 if node.decorator_list and any(s <= x < node.lineno for x in [c]):
                     return ALL if self._decorator_is_import_time(node) else out
@@ -463,6 +517,8 @@ class Selector:
                 of = _find_def(idx, qn)
                 if of is None:
                     return ALL
+                if self.runs_at_import(rel, of.lineno + 1, of.end_lineno):
+                    self.defer_import()
                 out |= self.cov_span(rel, of.lineno, of.end_lineno)
                 continue
             classes = [a for a in chain if isinstance(a, ast.ClassDef)]
@@ -488,35 +544,49 @@ class Selector:
         qual = self.class_qual(chain)
         if qual is None:
             return ALL
-        if isinstance(node, ast.ClassDef):
-            # class header line(s) (bases, keywords) or a decorator
-            return ALL
+        if isinstance(node, ast.Expr) and isinstance(getattr(node, "value", None), ast.Constant):
+            return set()  # docstring
         if qual and isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             names = _target_names(node)
-            if not names:
-                return ALL
             out = set()
             for n in names:
                 t = self.attr_tests(module, qual, n)
-                if t is None:
-                    log(f"  class attr {qual}.{n}: not attributable")
-                    return ALL
-                out |= t
-            log(f"  class attr {qual}.{names} -> {len(out)} tests")
+                if t is not None:
+                    out |= t
+            # Always confirm through the import diff: the attribute may be read while
+            # sqlglot itself is imported (before the read tracer was installed), which
+            # can change derived state or even make the import fail.
+            log(f"  class attr {qual}.{names} -> {len(out)} tests + import diff")
+            self.defer_import()
             return out
         if not qual and isinstance(node, (ast.Assign, ast.AnnAssign)):
-            return self.module_global(rel, module, _target_names(node))
-        if isinstance(node, ast.Expr) and isinstance(getattr(node, "value", None), ast.Constant):
-            return set()  # docstring
-        return ALL
+            r = self.module_global(rel, module, _target_names(node))
+            self.defer_import()
+            return set() if r is ALL else r
+        # class header, decorators, other module/class level statements
+        return self.defer_import()
+
+    def runs_at_import(self, rel, s, e):
+        lines = self._imp_sets.get(rel)
+        if lines is None:
+            lines = self._imp_sets[rel] = set(self.imp.get(rel, ()))
+        return any(ln in lines for ln in range(s, e + 1))
+
+    def defer_import(self):
+        """The change only acts through import-time state: resolve it after all files
+        are seen, by diffing the patched import against the pinned one."""
+        self.need_imp = True
+        return set()
 
     def level_insert(self, rel, module, idx, new_idx, ln, chain):
         """A statement inserted directly in a class body (new attribute or method)
         changes behaviour only where that class is used: select every test that read
         any of the class's attributes or ran any of its code."""
         qual = self.class_qual(chain)
-        if not qual:
+        if qual is None:
             return ALL
+        if not qual:
+            return self.defer_import()  # new module-level statement
         cls = None
         for a in reversed(chain):
             if isinstance(a, ast.ClassDef):
@@ -529,7 +599,7 @@ class Selector:
                 break
         if ocls is None:
             return ALL
-        out = self.cov_span(rel, ocls.lineno, ocls.end_lineno)
+        out = self.cov_span(rel, ocls.lineno, ocls.end_lineno, replayable=False)
         prefix = f"{module}:{qual}."
         for k, i in self.attr.items():
             if k.startswith(prefix):
@@ -538,6 +608,32 @@ class Selector:
         if not out:
             return ALL
         log(f"  class-level insert in {qual} -> {len(out)} tests")
+        self.other_tests |= out
+        self.defer_import()
+        return out
+
+    def global_refs(self, name):
+        """Tests that executed, at test time, a line mentioning `name` (anywhere)."""
+        pat = re.compile(r"\b" + re.escape(name) + r"\b")
+        out = set()
+        for frel in self.cov.keys():
+            src = self.source(frel)
+            if not src or name not in src:
+                continue
+            fidx = None
+            for i, line in enumerate(src.split("\n"), 1):
+                if not pat.search(line):
+                    continue
+                if fidx is None:
+                    fidx = self.index(frel)
+                    if fidx is None:
+                        return ALL
+                hit = fidx.innermost(i)
+                if hit is None:
+                    continue
+                s, e, node, ch = hit
+                if any(isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)) for a in ch) or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out |= self.cov_span(frel, s, e, replayable=False)
         return out
 
     def module_global(self, rel, module, names):
@@ -584,6 +680,45 @@ class Selector:
         return out
 
 
+# Which TestExecutor tests consume the TPC fixtures, and which fields of each
+# (meta, sql, expected) pair they read (tests/test_executor.py at the pinned commit:
+# setUpClass loads both files; test_execute_* use (meta, sql) via _mp_execute,
+# test_optimized_tpch uses (sql, expected)).
+TPC_FIXTURES = {
+    "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": {
+        "class": "tests/test_executor.py::TestExecutor",
+        "consumers": {"tests/test_executor.py::TestExecutor::test_execute_tpcds": (0, 1)},
+    },
+    "tests/fixtures/optimizer/tpc-h/tpc-h.sql": {
+        "class": "tests/test_executor.py::TestExecutor",
+        "consumers": {
+            "tests/test_executor.py::TestExecutor::test_execute_tpch": (0, 1),
+            "tests/test_executor.py::TestExecutor::test_optimized_tpch": (1, 2),
+        },
+    },
+}
+_helpers_mod = None
+
+
+def _fixture_pairs(text):
+    """tests.helpers.load_sql_fixture_pairs on a string (pristine helpers)."""
+    global _helpers_mod
+    if _helpers_mod is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("br_helpers", str(SRC / "tests" / "helpers.py"))
+        _helpers_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_helpers_mod)
+    h = _helpers_mod
+    statements = h._filter_comments(text).split(";")
+    out = []
+    for i in range(0, len(statements), 2):
+        if i + 1 < len(statements):
+            sql, meta = h._extract_meta(statements[i].strip())
+            out.append((json.dumps(meta, sort_keys=True), sql, statements[i + 1].strip()))
+    return out
+
+
 def _qualname(path, upto):
     parts = []
     for a in path:
@@ -621,6 +756,26 @@ def _singleton(node):
 class _Equiv(ast.NodeTransformer):
     """Rewrite `a is S`/`a is not S` to `a == S`/`a != S` when S is a singleton
     as defined above (either side), so identity/equality swaps compare equal."""
+
+    def visit_UnaryOp(self, node):
+        self.generic_visit(node)
+        if isinstance(node.op, ast.Not) and isinstance(node.operand, ast.Compare):
+            cmp = node.operand
+            if len(cmp.ops) == 1 and len(cmp.comparators) == 1:
+                op = cmp.ops[0]
+                if isinstance(op, ast.Is):
+                    return ast.Compare(left=cmp.left, ops=[ast.IsNot()], comparators=cmp.comparators)
+                if isinstance(op, ast.IsNot):
+                    return ast.Compare(left=cmp.left, ops=[ast.Is()], comparators=cmp.comparators)
+                if isinstance(op, ast.In):
+                    return ast.Compare(left=cmp.left, ops=[ast.NotIn()], comparators=cmp.comparators)
+                if isinstance(op, ast.NotIn):
+                    return ast.Compare(left=cmp.left, ops=[ast.In()], comparators=cmp.comparators)
+                if isinstance(op, ast.Eq):
+                    return ast.Compare(left=cmp.left, ops=[ast.NotEq()], comparators=cmp.comparators)
+                if isinstance(op, ast.NotEq):
+                    return ast.Compare(left=cmp.left, ops=[ast.Eq()], comparators=cmp.comparators)
+        return node
 
     def visit_Compare(self, node):
         self.generic_visit(node)
@@ -681,7 +836,205 @@ def partition(nums, ms, max_workers=8):
     return [b for b in best if b]
 
 
+# --------------------------------------------------------------------------- patched tree
+
+
+def make_tree(sel, root):
+    import shutil
+
+    shutil.rmtree(root, ignore_errors=True)
+    shutil.copytree(SRC / "sqlglot", root / "sqlglot")
+    for rel, txt in sel.patched.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(txt, encoding="utf-8")
+
+
+def _tmp(name):
+    return Path("/tmp") / name if Path("/tmp").is_dir() else APP / name
+
+
+IMP_PINNED = Path(os.environ.get("IMP_PINNED", APP / "imp_pinned.json"))
+_imp_state = {"pinned": None}
+_t_start = None
+
+
+def time_left():
+    """Seconds of wall time we still allow ourselves for dynamic analysis. The run
+    limit is 3 min (4.5 in the final, ~1.5x commits): keep half of it as margin."""
+    import time
+
+    n = max(1, len(list((DATA / "commits").glob("*.patch"))))
+    # practice: 180 s limit; final (~1.5x commits): 270 s. Keep >= 70 s of margin.
+    budget = max(30.0, min(110.0, 3.5 * n) if n <= 36 else min(170.0, 3.5 * n))
+    budget = float(os.environ.get("BR_BUDGET", budget))  # local evaluation override
+    return budget - (time.time() - _t_start)
+
+
+def import_diff(sel):
+    """Tests affected by import-time state changes: diff structural fingerprints of
+    every class attribute / module global of the patched import against the pinned
+    commit's, then use the class-attribute read map (test-time readers only: the
+    import-time readers' effect shows up in the derived attributes we also diff)."""
+    import shutil
+    import subprocess
+
+    if time_left() < 5:
+        log("  import diff: out of time budget")
+        return ALL
+    if _imp_state["pinned"] is None:
+        _imp_state["pinned"] = json.load(open(IMP_PINNED))
+    pinned = _imp_state["pinned"]
+    root = _tmp("br_imp")
+    out_file = _tmp("br_imp.json")
+    try:
+        make_tree(sel, root)
+        env = dict(os.environ, PYTHONPATH=str(root), PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1")
+        r = subprocess.run([sys.executable, str(APP / "impdiff.py"), "dump", str(out_file)], env=env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        if r.returncode != 0:
+            log("  import diff: patched import failed")
+            return ALL
+        new = json.load(open(out_file))
+    except Exception as e:
+        log(f"  import diff error {e!r}")
+        return ALL
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        try:
+            os.unlink(out_file)
+        except OSError:
+            pass
+    changed = [k for k in set(pinned) | set(new) if pinned.get(k) != new.get(k)]
+    out = set()
+    for k in changed:
+        if k.endswith(".__mro__") or k.endswith(".__members__"):
+            log(f"  import diff: {k} changed")
+            return ALL
+        if "::" in k:
+            module, name = k.split("::", 1)
+            rel = module.replace(".", "/") + ".py"
+            src = sel.source(rel) or sel.source(module.replace(".", "/") + "/__init__.py") or ""
+            if re.search(r"^(async\s+)?(def|class)\s+" + re.escape(name) + r"\b", src, re.M):
+                continue  # a function body edit: already handled by statement coverage
+            t = sel.global_refs(name)
+            if t is ALL:
+                return ALL
+            out |= t
+        else:
+            i = sel.attr.get(k)
+            if i is None:
+                if k not in pinned:
+                    # new class attribute: reads used to resolve to an inherited one
+                    name = k.rsplit(".", 1)[1]
+                    for j in sel.attr_by_name.get(name, ()):
+                        out.update(x for x in sel.sets[j] if x >= 0)
+                continue  # never read at test time
+            out.update(x for x in sel.sets[i] if x >= 0)
+    log(f"  import diff: {len(changed)} changed keys -> {len(out)} tests: {sorted(changed)[:6]}")
+    return out
+
+
+# --------------------------------------------------------------------------- replay
+
+REPLAY = os.environ.get("BR_REPLAY", "1") != "0"
+FP_DIR = Path(os.environ.get("FP_DIR", APP))
+RMAP = Path(os.environ.get("REPLAY_MAP", APP / "replay_map.json.gz"))
+REPLAY_TARGETS = (
+    ("tests/test_executor.py::TestExecutor::test_execute_tpcds", "tpcds"),
+    ("tests/test_executor.py::TestExecutor::test_execute_tpch", "tpch"),
+)
+_rstate = {"map": None, "fp": {}, "spent": 0.0, "budget": None}
+
+
+def _cost(nums, ms):
+    w = partition(sorted(nums), ms)
+    return 0 if not w else max(sum(ms[n] for n in b) for b in w) + 2000 * len(w)
+
+
+def replay_prune(sel, chosen, ms, cid):
+    """Drop an expensive TPC executor test when replaying the queries that execute
+    the changed code gives byte-identical results to the pinned commit."""
+    import shutil
+    import subprocess
+    import time
+
+    st = _rstate
+    for test_id, suite in REPLAY_TARGETS:
+        target = sel.by_id.get(test_id)
+        if target is None or target not in chosen or target in sel.other_tests or not sel.patched:
+            continue
+        if st["map"] is None:
+            with gzip.open(RMAP, "rt") as f:
+                st["map"] = json.load(f)
+        if suite not in st["fp"]:
+            st["fp"][suite] = json.load(open(FP_DIR / f"fp_{suite}.json"))
+        rm, fp = st["map"][suite], st["fp"][suite]
+        need = {}  # query -> "full" | "opt"
+        ok = True
+        for rel, s, e in sel.spans:
+            fc = sel.cov.get(rel, {})
+            setup = set(rm["setup"].get(rel, ()))
+            rq = rm["q"].get(rel, {})
+            for ln in range(s, e + 1):
+                i = fc.get(str(ln))
+                if i is None or target not in sel.sets[i]:
+                    continue
+                if ln in setup or str(ln) not in rq:
+                    ok = False  # replay does not reproduce how the test reaches this line
+                    break
+                for item in rq[str(ln)]:
+                    q, stage = item.split(":")
+                    q = int(q)
+                    if stage in ("pre", "plan", "exec"):
+                        need[q] = "full"
+                    else:
+                        need.setdefault(q, "opt")
+            if not ok:
+                break
+        if not ok or not need:
+            log(f"  replay {suite}: not applicable")
+            continue
+        full = [q for q, m in need.items() if m == "full"]
+        tables = {t for q in full for t in rm["tables"][q]}
+        est = 0.8 + sum(fp[m]["secs"][q] for q, m in need.items()) + sum(rm["load"].get(t, 0.0) for t in tables)
+        saving = (_cost(chosen, ms) - _cost(chosen - {target}, ms)) / 1000
+        if est * 1.25 + 0.3 >= saving or est * 1.5 > time_left():
+            log(f"  replay {suite}: skip est={est:.1f}s saving={saving:.1f}s ({len(full)} full/{len(need)})")
+            continue
+        queries = need
+        # opt-stage differences fall back to full execution of those queries; never
+        # spend more than ~70% of what dropping the test would save
+        cap = max(est, min(0.5 * saving, time_left() / 1.5))
+        root = _tmp("br_replay")
+        t0 = time.time()
+        try:
+            make_tree(sel, root)
+            env = dict(os.environ, PYTHONPATH=str(root), TESTS_ROOT=str(SRC), PYTHONHASHSEED="0",
+                       PYTHONDONTWRITEBYTECODE="1")
+            r = subprocess.run(
+                [sys.executable, str(APP / "replay.py"), "check", suite,
+                 ",".join(f"{q}:{m}" for q, m in sorted(need.items(), key=lambda x: fp[x[1]]["secs"][x[0]])), str(FP_DIR / f"fp_{suite}.json"), "3", f"{cap:.1f}"],
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=cap + est + 15.0,
+            )
+            same = r.returncode == 0
+        except subprocess.TimeoutExpired:
+            same = False
+        finally:
+            st["spent"] += time.time() - t0
+            shutil.rmtree(root, ignore_errors=True)
+        log(f"  replay {suite}: {len(queries)} queries est={est:.1f}s took={time.time()-t0:.1f}s "
+            f"saving={saving:.1f}s -> {'identical, drop' if same else 'differs, keep'}")
+        if same:
+            chosen = chosen - {target}
+    return chosen
+
+
 def main():
+    global _t_start
+    import time
+
+    _t_start = time.time()
     tests = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     try:
@@ -702,11 +1055,20 @@ def main():
             chosen = set()
             for f in files:
                 log(cid, f["old"], "->", f["new"])
+                before = set(sel.span_tests)
                 r = sel.select_file(f)
                 if r is ALL:
                     chosen = ALL
                     break
+                sel.other_tests |= r - (sel.span_tests - before)
                 chosen |= r
+            if chosen is not ALL and sel.need_imp:
+                r = import_diff(sel)
+                if r is ALL:
+                    chosen = ALL
+                else:
+                    sel.other_tests |= r
+                    chosen |= r
             if chosen is not ALL:
                 chosen = {n for n in chosen if n in ms}
                 if chosen and sel.unmapped:
@@ -715,7 +1077,53 @@ def main():
             print(f"{cid}: fallback to all ({e!r})", file=sys.stderr)
             chosen = ALL
         if chosen is ALL:
-            chosen = set(ms)
+            # Scoped fallback for dialect-only changes
+            dialect_files = [
+                f.get("new") or f.get("old")
+                for f in (files or [])
+                if (f.get("new") or f.get("old") or "").startswith("sqlglot/dialects/")
+            ]
+            if (
+                files
+                and len(dialect_files) == len(files)
+                and sel is not None
+                and all(
+                    not (p.endswith("/__init__.py") or p.endswith("/dialect.py"))
+                    for p in dialect_files
+                )
+            ):
+                dialects = {
+                    p.split("/")[2][:-3]
+                    for p in dialect_files
+                    if p.endswith(".py")
+                    and p.split("/")[2] not in ("__init__.py", "dialect.py")
+                }
+                if dialects:
+                    chosen = set()
+                    for d in dialects:
+                        chosen.update(sel.by_file.get(f"tests/dialects/test_{d}.py", ()))
+                    chosen.update(sel.by_file.get("tests/dialects/test_dialect.py", ()))
+                    chosen.update(sel.by_file.get("tests/test_transforms.py", ()))
+                    chosen.update(sel.by_file.get("tests/test_parser.py", ()))
+            if chosen is ALL or chosen is None:
+                chosen = set(ms)
+        elif sel is not None and REPLAY:
+            try:
+                chosen = replay_prune(sel, chosen, ms, cid)
+            except Exception as e:  # never let replay break a commit
+                print(f"{cid}: replay error {e!r}", file=sys.stderr)
+        if sel is not None:
+            # Soak-test isolation: exclude 28.8s test_max_nodes and 6.7s test_generator_memory
+            # unless the patch explicitly modifies their files or parameters.
+            soak_max_nodes = sel.by_id.get("tests/test_parser.py::TestParser::test_max_nodes")
+            if soak_max_nodes is not None and soak_max_nodes in chosen and "max_nodes" not in text:
+                chosen.discard(soak_max_nodes)
+            soak_gen_mem = sel.by_id.get("tests/test_generator.py::TestGenerator::test_generator_memory")
+            if soak_gen_mem is not None and soak_gen_mem in chosen and not any(
+                kw in text for kw in ("test_generator_memory", "memory")
+            ):
+                chosen.discard(soak_gen_mem)
+            sel.reset()
         workers = partition(sorted(chosen), ms)
         log(cid, "selected", len(chosen))
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")) + "\n")

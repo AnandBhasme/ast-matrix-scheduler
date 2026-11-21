@@ -12,9 +12,19 @@ RUN mkdir -p /app/src \
     && rm /tmp/sqlglot.tar.gz
 
 # map.json.gz: per-test coverage / fixture / class-attribute map built offline
-# from the pinned commit with tools/ (see progress.md)
-COPY map.json.gz selector.py /app/
-RUN chmod -R a+rX /app && python -c "import ast,sys; ast.parse(open('/app/selector.py').read())"
+# from the pinned commit. replay_map.json.gz: per-query coverage of replay.py.
+COPY map.json.gz replay_map.json.gz selector.py replay.py impdiff.py /app/
+
+# Pinned-commit fingerprints: every TPC-H / TPC-DS executor query (differential replay)
+# and every class attribute / module global after import (differential import).
+# Bytecode for the pinned sources: imports in the sandbox (patched copies in /tmp keep
+# mtimes, so only patched files recompile) take ~0.5 s instead of ~2.5 s.
+RUN python -m compileall -q /app/src/sqlglot /app/impdiff.py /app/replay.py
+RUN cd /app && export PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 TESTS_ROOT=/app/src PYTHONPATH=/app/src \
+    && python replay.py fingerprint tpch /app/fp_tpch.json \
+    && python replay.py fingerprint tpcds /app/fp_tpcds.json \
+    && python impdiff.py dump /app/imp_pinned.json \
+    && chmod -R a+rX /app
 
 ENV PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "-S", "/app/selector.py"]
