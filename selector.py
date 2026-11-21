@@ -370,7 +370,12 @@ class Selector:
             new_tree = ast.parse(new)
             old_tree = ast.parse(src)
         except (ValueError, SyntaxError):
-            return set(self.by_file.get(rel, [])) or ALL
+            if rel not in self.by_file:
+                return ALL
+            out = set(self.by_file[rel])
+            for u in self.test_importers(rel):  # a broken module breaks its importers too
+                out |= set(self.by_file.get(u, ()))
+            return out
         if _norm(old_tree) == _norm(new_tree):
             return set()
         if rel not in self.by_file:
@@ -395,6 +400,15 @@ class Selector:
 
         of, orest = funcs(old_tree)
         nf, nrest = funcs(new_tree)
+        users = self.test_importers(rel)
+        if users:
+            # other test modules import this one (e.g. dialect tests subclass
+            # tests/dialects/test_dialect.py::Validator): any change can reach them
+            log(f"  test module imported by {len(users)} others")
+            out = set(self.by_file[rel])
+            for u in users:
+                out |= set(self.by_file.get(u, ()))
+            return out
         if orest != nrest:
             return set(self.by_file[rel])
         sel = set()
@@ -407,6 +421,41 @@ class Selector:
                     return set(self.by_file[rel])
                 sel.add(n)
         return sel
+
+    def test_importers(self, rel):
+        """Test modules that import `rel` (transitively), from the tests sources."""
+        g = getattr(self, "_timp", None)
+        if g is None:
+            g = {}
+            root = SRC / "tests"
+            for p in root.rglob("*.py"):
+                r = str(p.relative_to(SRC))
+                try:
+                    tree = ast.parse(p.read_text(encoding="utf-8"))
+                except (OSError, SyntaxError, UnicodeDecodeError):
+                    continue
+                pkg = r.rsplit("/", 1)[0].replace("/", ".")
+                for node in ast.walk(tree):
+                    mods = []
+                    if isinstance(node, ast.Import):
+                        mods = [a.name for a in node.names]
+                    elif isinstance(node, ast.ImportFrom):
+                        base = node.module or ""
+                        if node.level:
+                            parts = pkg.split(".")[: len(pkg.split(".")) - node.level + 1]
+                            base = ".".join(parts + ([base] if base else []))
+                        mods = [base] + [f"{base}.{a.name}" for a in node.names]
+                    for m in mods:
+                        if m.startswith("tests"):
+                            g.setdefault(m.replace(".", "/") + ".py", set()).add(r)
+            self._timp = g
+        out, todo = set(), [rel]
+        while todo:
+            for u in g.get(todo.pop(), ()):
+                if u not in out and u != rel:
+                    out.add(u)
+                    todo.append(u)
+        return out
 
     def select_sqlglot_py(self, rel, hunks):
         try:
