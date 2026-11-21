@@ -22,3 +22,6 @@ cases.pkl.gz
 
 # Docker build artifacts
 .dockerignore.swp
+
+# offline mutation-table pipeline data
+work/

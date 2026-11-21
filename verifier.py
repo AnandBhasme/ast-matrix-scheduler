@@ -19,6 +19,7 @@ Requests / replies are JSON lines on stdin / stdout:
 import concurrent.futures as cf
 import gc
 import importlib
+import io
 import importlib.machinery
 import json
 import os
@@ -86,7 +87,8 @@ def _codes(co, out):
 
 def swap(rel, new_src):
     path = os.path.join(SRC, rel)
-    old_src = open(path, encoding="utf-8").read()
+    with io.open_code(path) as fh:  # never an overlay: always the pristine file
+        old_src = fh.read().decode("utf-8")
     old = _codes(compile(old_src, path, "exec"), {})
     new = _codes(compile(new_src, path, "exec"), {})
     if set(old) != set(new) or any(len(old[q]) != len(new[q]) for q in old):
@@ -98,6 +100,8 @@ def swap(rel, new_src):
                 if a.co_freevars != b.co_freevars or a.co_cellvars != b.co_cellvars:
                     raise Unswappable(f"closure layout changed in {q}")
                 mapping[a] = b
+    if not mapping and old_src != new_src:
+        raise Unswappable("source differs but no code object changed")
     n = 0
     for f in gc.get_objects():
         if type(f) is types.FunctionType:
@@ -106,6 +110,39 @@ def swap(rel, new_src):
                 f.__code__ = nc
                 n += 1
     return n
+
+
+# ---------------------------------------------------------------- source overlays
+def install_overlays(files):
+    """Tests that read sqlglot sources from disk (e.g. test_typing reads
+    sqlglot/typing/*.py) or tracebacks (linecache) must see the patched text."""
+    import builtins
+    import io
+    import linecache
+
+    patched = {os.path.realpath(os.path.join(SRC, rel)): src for rel, src in files.items()}
+    for path, src in patched.items():
+        linecache.cache[path] = (len(src), None, src.splitlines(True), path)
+    orig_open = io.open
+
+    def overlay_open(file, mode="r", *args, **kwargs):
+        if isinstance(file, (str, bytes, os.PathLike)) and not any(c in mode for c in "wax+"):
+            try:
+                p = os.path.realpath(os.fsdecode(file))
+            except Exception:
+                p = None
+            src = patched.get(p)
+            if src is not None:
+                if "b" in mode:
+                    s = io.BytesIO(src.encode("utf-8"))
+                else:
+                    s = io.StringIO(src)
+                s.name = p
+                return s
+        return orig_open(file, mode, *args, **kwargs)
+
+    builtins.open = overlay_open
+    io.open = overlay_open
 
 
 # ---------------------------------------------------------------- re-importing
@@ -153,6 +190,18 @@ def _uid(pytest_id):
     return path[:-3].replace("/", "."), rest
 
 
+class _SubTestFailFast(unittest.TestResult):
+    """failfast=True makes subTest() end a test at its first failing subtest (the
+    verdict is settled); stop() is a no-op so the rest of the suite still runs."""
+
+    def __init__(self):
+        super().__init__()
+        self.failfast = True
+
+    def stop(self):
+        pass
+
+
 def run_tests(ids):
     failed = set()
     by_uid = {}
@@ -165,7 +214,7 @@ def run_tests(ids):
             obj = getattr(obj, r)
         by_uid[".".join([mod] + rest)] = tid
         suite.addTest(unittest.defaultTestLoader.loadTestsFromName(".".join([mod] + rest)))
-    result = unittest.TestResult()
+    result = _SubTestFailFast()
     suite.run(result)
     for test, _ in result.failures + result.errors + [(t, None) for t in result.unexpectedSuccesses]:
         case = getattr(test, "test_case", test)  # _SubTest -> its TestCase
@@ -205,6 +254,8 @@ def handle(req):
             else:
                 for rel, src in req["files"].items():
                     swap(rel, src)
+            # after the swap: swap() must read the pristine file, tests the patched one
+            install_overlays(req["files"])
             if req.get("failfast"):
                 passed, failed = run_failfast(req["tests"])
                 out = {"failed": failed, "passed": passed, "ok": True}

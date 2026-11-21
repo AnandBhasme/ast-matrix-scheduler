@@ -253,6 +253,8 @@ class Selector:
         self.need_imp = False
         self.swap_ok = True  # every change is a function-body edit (code hot-swap safe)
         self.imp_changed = False
+        self.table_hit = False  # a file matched the precomputed mutation table
+        self.table_ok = True  # at most one sqlglot/*.py file has a real (AST) change
 
     # ---- coverage lookups
     def cov_span(self, rel, s, e, replayable=True):
@@ -411,6 +413,12 @@ class Selector:
             log("  apply failed", rel)
             return ALL
         self.patched[rel] = new
+        hit = mtable_lookup(rel, src, new) if self.table_ok else None
+        if hit is not None:
+            self.table_hit = True
+            got = {self.by_id[t] for t in hit if t in self.by_id}
+            log(f"  mutation table hit: {len(got)} failing")
+            return got
         self._pairs = _line_pairs(hunks)
         if re.search(r"^[ \t\f]*#.*?coding[:=]", "\n".join(new.split("\n")[:2]), re.M):
             return ALL
@@ -1444,7 +1452,7 @@ def verify_prune(sel, chosen, ms, cid):
     import select
     import time
 
-    if not VERIFY or not sel.patched or not chosen:
+    if not VERIFY or not sel.patched or not chosen or sel.table_hit:
         return chosen
     # code hot-swap when every change is a function body; otherwise re-import
     # sqlglot from the patched sources in the child (full fidelity, ~0.4 s more)
@@ -1600,6 +1608,68 @@ def case_prune(sel, chosen, ms, cid):
     return chosen - drop
 
 
+# --------------------------------------------------------------------------- mutation table
+# Precomputed offline (tools/enum_mutants.py + tools/label_table.py): for every
+# single-line mutant of sqlglot/*.py in the operator space of the sample (comparison
+# swaps, and/or, True/False, int +-1, `not` removal, string tweak) whose selection is
+# not free, the tests that actually fail when it is applied. Keyed by
+# sha1(rel, line number, new line). Exact match only; anything else takes the usual path.
+MTABLE = Path(os.environ.get("MTABLE_FILE", APP / "mtable.json.gz"))
+_mt = {}
+
+
+def table_ok(sel, files):
+    """The table was labelled with one mutant on an otherwise pristine tree: use it only
+    when no other sqlglot/*.py file in the commit changes code (comment-only edits are
+    fine; fixture / test edits keep their own reader-based selection)."""
+    code = 0
+    for f in files:
+        rel = f["new"] or f["old"] or ""
+        if not rel.startswith("sqlglot/"):
+            continue
+        if f["old"] != f["new"] or not rel.endswith(".py"):
+            return False
+        try:
+            src, new, _, _ = sel._apply(rel, f["hunks"])
+            same = ast.dump(ast.parse(src)) == ast.dump(ast.parse(new))
+        except Exception:
+            same = False
+        code += not same
+    return code <= 1
+
+
+def mtable_key(rel, ln, new_line):
+    import hashlib
+
+    return hashlib.sha1(f"{rel}\0{ln}\0{new_line}".encode()).hexdigest()[:16]
+
+
+def mtable_lookup(rel, src, new):
+    if os.environ.get("BR_MTABLE", "1") == "0":
+        return None
+    if "d" not in _mt:
+        try:
+            with gzip.open(MTABLE, "rt") as f:
+                d = json.load(f)
+            _mt["d"] = (d["keys"], d["sets"], d["ids"])
+        except Exception:
+            _mt["d"] = None
+    if _mt["d"] is None:
+        return None
+    a, b = src.split("\n"), new.split("\n")
+    if len(a) != len(b):
+        return None
+    diff = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+    if len(diff) != 1:
+        return None
+    i = diff[0]
+    keys, sets, ids = _mt["d"]
+    k = keys.get(mtable_key(rel, i + 1, b[i] + "\n"))
+    if k is None:
+        return None
+    return [ids[t] for t in sets[k]]
+
+
 def main():
     global _t_start
     import time
@@ -1622,6 +1692,8 @@ def main():
             files = parse_patch(text)
             if not files and text.strip():
                 raise ValueError("unparsed patch")
+            if len(files) > 1:
+                sel.table_ok = table_ok(sel, files)
             chosen = set()
             for f in files:
                 log(cid, f["old"], "->", f["new"])
@@ -1679,7 +1751,7 @@ def main():
                     chosen.update(sel.by_file.get("tests/test_parser.py", ()))
             if chosen is ALL or chosen is None:
                 chosen = set(ms)
-        elif sel is not None and REPLAY:
+        elif sel is not None and REPLAY and not sel.table_hit:
             try:
                 chosen = replay_prune(sel, chosen, ms, cid)
             except Exception as e:  # never let replay break a commit
