@@ -1113,16 +1113,10 @@ def main():
             except Exception as e:  # never let replay break a commit
                 print(f"{cid}: replay error {e!r}", file=sys.stderr)
         if sel is not None:
-            # Soak-test isolation: exclude 28.8s test_max_nodes and 6.7s test_generator_memory
-            # unless the patch explicitly modifies their files or parameters.
-            soak_max_nodes = sel.by_id.get("tests/test_parser.py::TestParser::test_max_nodes")
-            if soak_max_nodes is not None and soak_max_nodes in chosen and "max_nodes" not in text:
-                chosen.discard(soak_max_nodes)
-            soak_gen_mem = sel.by_id.get("tests/test_generator.py::TestGenerator::test_generator_memory")
-            if soak_gen_mem is not None and soak_gen_mem in chosen and not any(
-                kw in text for kw in ("test_generator_memory", "memory")
-            ):
-                chosen.discard(soak_gen_mem)
+            # NOTE: no "soak-test quarantine". Dropping test_max_nodes /
+            # test_generator_memory unconditionally is unsound: test_max_nodes also
+            # asserts that ordinary queries parse, so it fails whenever basic parsing or
+            # the import breaks (verified on a tokenizer_core.py mutant: 300 s miss).
             sel.reset()
         workers = partition(sorted(chosen), ms)
         log(cid, "selected", len(chosen))
