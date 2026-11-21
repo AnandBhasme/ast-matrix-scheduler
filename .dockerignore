@@ -1,0 +1,9 @@
+.git
+sqlglot-repo
+sample
+benchmarks
+*.tar.gz
+*.jsonl
+__pycache__
+progress.md
+tools

@@ -1,0 +1,22 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Benchmark runs and intermediate outputs
+output*.jsonl
+benchmarks/
+*.tar.gz
+*.log
+
+# Local checkouts and test sets
+sqlglot-repo/
+sample/
+
+# Internal scratch tools and agent collaboration log (stays local only)
+progress.md
+tools/
+
+# Docker build artifacts
+.dockerignore.swp
