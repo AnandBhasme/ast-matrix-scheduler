@@ -3,20 +3,23 @@
 A zygote imports the pristine sqlglot (and the test dependencies) once. For each
 request it forks a child that
 
-  1. replaces the __code__ of every function / closure / lambda whose code the patch
-     changes (function-body edits only: the selector only asks for patches whose
-     changes are confined to code that does not run at import time),
-  2. imports the requested test modules (after the swap, so their import-time code
-     runs the patched sqlglot), and
-  3. runs the requested tests with unittest (a failing subtest fails the test).
+  1. mode "swap": replaces the __code__ of every function / closure / lambda whose
+     code the patch changes (function-body edits only), or
+     mode "reimport": forgets sqlglot and the test modules and re-imports them from
+     the patched sources (any in-place edit, including import-time state),
+  2. imports the requested test modules (after 1., so their import-time code runs
+     the patched sqlglot), and
+  3. runs the requested tests with unittest (a failing subtest fails the test);
+     with "failfast" one by one in the given order, stopping at the first failure.
 
 Requests / replies are JSON lines on stdin / stdout:
-  {"files": {rel: new_source}, "tests": [pytest ids], "timeout": seconds}
-  -> {"failed": [ids], "ok": bool}        ok=false: could not verify (keep all)
+  {"files": {rel: new_source}, "tests": [pytest ids], "timeout": s, "mode": m, "failfast": b}
+  -> {"failed": [ids], "passed": [ids], "ok": bool}   ok=false: could not verify (keep all)
 """
 import concurrent.futures as cf
 import gc
 import importlib
+import importlib.machinery
 import json
 import os
 import pickle
@@ -105,6 +108,45 @@ def swap(rel, new_src):
     return n
 
 
+# ---------------------------------------------------------------- re-importing
+_KEEP_ALIVE = []  # old modules stay referenced: no mass deallocation in the child
+
+
+class _PatchedLoader(importlib.machinery.SourceFileLoader):
+    def __init__(self, fullname, path, src):
+        super().__init__(fullname, path)
+        self._src = src
+
+    def get_code(self, fullname):
+        return compile(self._src, self.path, "exec", dont_inherit=True)
+
+
+class _PatchedFinder:
+    def __init__(self, files):
+        self.files = {os.path.realpath(os.path.join(SRC, rel)): src for rel, src in files.items()}
+
+    def find_spec(self, name, path, target=None):
+        if name.split(".")[0] not in ("sqlglot", "tests"):
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(name, path)
+        if spec is not None and spec.origin:
+            src = self.files.get(os.path.realpath(spec.origin))
+            if src is not None:
+                spec.loader = _PatchedLoader(name, spec.origin, src)
+        return spec
+
+
+def reimport(files):
+    """Full-fidelity mode for edits a code swap cannot reproduce (class attributes,
+    defaults, decorators, module globals): forget sqlglot and the test modules and
+    import them again (lazily, as a test run would) from the patched sources."""
+    for name in list(sys.modules):
+        if name.split(".")[0] in ("sqlglot", "tests"):
+            _KEEP_ALIVE.append(sys.modules.pop(name))
+    importlib.invalidate_caches()
+    sys.meta_path.insert(0, _PatchedFinder(files))
+
+
 # ---------------------------------------------------------------- running tests
 def _uid(pytest_id):
     path, *rest = pytest_id.split("::")
@@ -137,6 +179,17 @@ def run_tests(ids):
     return sorted(failed)
 
 
+def run_failfast(ids):
+    """Run the tests one by one in the given order and stop at the first failure.
+    Returns (passed, failed); tests after the failure are in neither."""
+    passed = []
+    for tid in ids:
+        if run_tests([tid]):
+            return passed, [tid]
+        passed.append(tid)
+    return passed, []
+
+
 def handle(req):
     r, w = os.pipe()
     pid = os.fork()
@@ -147,9 +200,17 @@ def handle(req):
         sys.stdout = open(os.devnull, "w")
         gc.unfreeze()
         try:
-            for rel, src in req["files"].items():
-                swap(rel, src)
-            out = {"failed": run_tests(req["tests"]), "ok": True}
+            if req.get("mode") == "reimport":
+                reimport(req["files"])
+            else:
+                for rel, src in req["files"].items():
+                    swap(rel, src)
+            if req.get("failfast"):
+                passed, failed = run_failfast(req["tests"])
+                out = {"failed": failed, "passed": passed, "ok": True}
+            else:
+                failed = run_tests(req["tests"])
+                out = {"failed": failed, "passed": [t for t in req["tests"] if t not in failed], "ok": True}
         except BaseException as e:  # noqa: BLE001
             out = {"failed": list(req["tests"]), "ok": False, "err": repr(e)[:200]}
         data = json.dumps(out).encode()
@@ -186,8 +247,9 @@ def main():
     for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
         if not m.name.endswith("__main__"):
             importlib.import_module(m.name)
-    # pandas / duckdb are imported lazily by the (few) tests that need them
-    for heavy in ("tests", "tests.helpers"):
+    # duckdb (0.1 s) is imported by test_optimizer / test_executor at module level:
+    # load it once here; pandas (1.7 s) stays lazy (cost model: vcost.json.gz)
+    for heavy in ("duckdb", "tests", "tests.helpers"):
         try:
             importlib.import_module(heavy)
         except Exception:

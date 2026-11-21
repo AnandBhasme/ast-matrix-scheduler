@@ -20,7 +20,7 @@ RUN mkdir -p /app/src \
 # from the pinned commit. replay_map.json.gz: per-query coverage of replay.py.
 # infect.json.gz: weak-mutation infection map (tools/brinfect.py): per comparison /
 # and-or site, which tests would see a different outcome under each alternative.
-COPY map.json.gz replay_map.json.gz infect.json.gz selector.py replay.py impdiff.py verifier.py /app/
+COPY map.json.gz replay_map.json.gz infect.json.gz vcost.json.gz selector.py replay.py impdiff.py verifier.py /app/
 
 # Pinned-commit fingerprints: every TPC-H / TPC-DS executor query (differential replay)
 # and every class attribute / module global after import (differential import).

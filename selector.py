@@ -1383,10 +1383,31 @@ def replay_prune(sel, chosen, ms, cid):
 
 VERIFY = os.environ.get("BR_VERIFY", "1") != "0"
 VERIFY_ALL = os.environ.get("BR_VERIFY_ALL") == "1"  # local fidelity checks only
+REIMPORT = os.environ.get("BR_REIMPORT", "1") != "0"
+V_TEST_CAP = float(os.environ.get("BR_V_TEST_CAP", "1500"))  # ms per verified test
+V_RUN_CAP = float(os.environ.get("BR_V_RUN_CAP", "3.0"))  # s of recorded test time per commit
+V_SCALE = float(os.environ.get("BR_V_SCALE", "1.5"))  # verifier CPU / recorded test time
+V_MARGIN = float(os.environ.get("BR_V_MARGIN", "0.5"))  # min expected net gain (s)
+V_OVER = (0.1, 0.25)  # fixed cost per request: swap, reimport (fork, swap / re-import)
+V_BASE = (0.03, 0.10)  # part of each measured single-test cost that is fixed overhead
+VCOST = Path(os.environ.get("VCOST_FILE", APP / "vcost.json.gz"))
+_vc = {}
+
+
+def _vcost():
+    if "d" not in _vc:
+        try:
+            with gzip.open(VCOST, "rt") as f:
+                _vc["d"] = json.load(f)
+        except Exception:
+            _vc["d"] = {}
+    return _vc["d"]
 # never verified (kept if selected): timing / memory sensitive or process-level tests
 NO_VERIFY = (
     "tests/test_generator.py::TestGenerator::test_generator_memory",
     "tests/test_parser.py::TestParser::test_max_nodes",
+    # runs `python -c "import sqlglot ..."`: a subprocess sees the unpatched files
+    "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
 )
 NO_VERIFY_FILES = ("tests/test_docs.py", "tests/test_sqlglotc.py", "tests/test_dialect_imports.py",
                    "tests/test_dialect_entry_points.py", "tests/test_build.py")
@@ -1423,29 +1444,52 @@ def verify_prune(sel, chosen, ms, cid):
     import select
     import time
 
-    if not VERIFY or not sel.swap_ok or not sel.patched or not chosen:
+    if not VERIFY or not sel.patched or not chosen:
         return chosen
-    cand = []
-    run = 0.0
-    for n in sorted(chosen, key=lambda n: (ms[n], n)):
-        tid = sel.ids_of(n)
-        if tid in NO_VERIFY or tid.split("::")[0] in NO_VERIFY_FILES:
-            continue
-        if not VERIFY_ALL and (ms[n] > 200 or run + ms[n] / 1000 > 1.0):
+    # code hot-swap when every change is a function body; otherwise re-import
+    # sqlglot from the patched sources in the child (full fidelity, ~0.4 s more)
+    mode = "swap" if sel.swap_ok and os.environ.get("BR_FORCE_REIMPORT") != "1" else "reimport"
+    if mode == "reimport" and not REIMPORT:
+        return chosen
+    mi = 0 if mode == "swap" else 1
+    over, base = V_OVER[mi], V_BASE[mi]
+    vc = _vcost()
+
+    def cost(n):  # verifier CPU for one test in a forked child (measured offline)
+        m = vc.get(sel.ids_of(n))
+        return max(m[mi] - base, 0.005) if m else V_SCALE * ms[n] / 1000 + 0.02
+
+    # candidates: cheapest first; verify the prefix with the best expected net gain
+    # (simulated-time saving minus the verifier's CPU -- both count 1:1 in the score)
+    elig = [n for n in sorted(chosen, key=lambda n: (cost(n), n))
+            if sel.ids_of(n) not in NO_VERIFY and sel.ids_of(n).split("::")[0] not in NO_VERIFY_FILES]
+    best, best_gain, cand, run, saving = 0, None, [], 0.0, 0.0
+    acc = 0.0
+    for k, n in enumerate(elig, 1):
+        if not VERIFY_ALL and (ms[n] > V_TEST_CAP or acc + cost(n) > V_RUN_CAP):
             break
-        cand.append(n)
-        run += ms[n] / 1000
+        acc += cost(n)
+        sv = (_cost(chosen, ms) - _cost(chosen - set(elig[:k]), ms)) / 1000
+        g = sv - acc - over
+        if best_gain is None or g > best_gain:
+            best, best_gain, run, saving = k, g, acc, sv
+    cand = elig if VERIFY_ALL else elig[:best]
+    if VERIFY_ALL:
+        run = sum(ms[n] for n in cand) / 1000
+        saving = (_cost(chosen, ms) - _cost(chosen - set(cand), ms)) / 1000
     if not cand:
         return chosen
-    saving = (_cost(chosen, ms) - _cost(chosen - set(cand), ms)) / 1000
-    if not VERIFY_ALL and (saving - run - 0.15 < 1.0 or 3 * run + 2 > time_left()):
-        log(f"  verify: skip {len(cand)} tests run={run:.2f}s saving={saving:.1f}s")
+    if not VERIFY_ALL and (best_gain < V_MARGIN or 3 * run + 2 + over > time_left()):
+        log(f"  verify[{mode}]: skip {len(cand)} tests run={run:.2f}s saving={saving:.1f}s")
         return chosen
     p = _verifier()
     if p is None:
         return chosen
     t0 = time.time()
-    req = {"files": dict(sel.patched), "tests": [sel.ids_of(n) for n in cand], "timeout": 3 * run + 5}
+    # a mutant can make a test slow: the child is killed at twice the estimate
+    tmo = 3 * run + 5 if VERIFY_ALL else 2 * (run + over) + 1
+    req = {"files": dict(sel.patched), "tests": [sel.ids_of(n) for n in cand], "timeout": tmo,
+           "mode": mode, "failfast": not VERIFY_ALL}
     stalled = False
     try:
         p.stdin.write((json.dumps(req) + "\n").encode())
@@ -1467,8 +1511,8 @@ def verify_prune(sel, chosen, ms, cid):
         log(f"  verify: could not verify ({rep.get('err', '')}) took={time.time()-t0:.2f}s")
         return chosen
     failed = {sel.by_id[t] for t in rep.get("failed", []) if t in sel.by_id}
-    passed = set(cand) - failed
-    log(f"  verify: {len(cand)} tests run={run:.2f}s took={time.time()-t0:.2f}s "
+    passed = {sel.by_id[t] for t in rep.get("passed", []) if t in sel.by_id} & set(cand)
+    log(f"  verify[{mode}]: {len(cand)} tests run={run:.2f}s took={time.time()-t0:.2f}s "
         f"saving<={saving:.1f}s -> {len(passed)} pass, {len(failed)} fail")
     sel.spare |= passed
     return chosen - passed
