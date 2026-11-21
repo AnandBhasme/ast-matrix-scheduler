@@ -1,4 +1,4 @@
-IMAGE ?= blast-radius-entry
+IMAGE ?= ast-matrix-scheduler
 SAMPLE := $(CURDIR)/sample
 OUTPUT := $(CURDIR)/output.jsonl
 

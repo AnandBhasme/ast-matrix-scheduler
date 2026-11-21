@@ -1,4 +1,4 @@
-"""Blast Radius selector (V3): coverage-map driven test impact analysis.
+"""AST Impact Selector: coverage-map driven test impact analysis.
 
 Maps (built offline from the pinned sqlglot commit, see tools/):
   cov  : sqlglot file -> line -> tests that executed it at test time
