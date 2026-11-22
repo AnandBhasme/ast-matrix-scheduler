@@ -345,6 +345,11 @@ class Selector:
             return ALL
         if src == new:
             return set()
+        if rel.endswith(".sql") and _fixture_text(src) == _fixture_text(new):
+            # every .sql fixture is read through tests/helpers.load_sql_fixtures /
+            # load_sql_fixture_pairs, which drop blank and "--" comment lines first
+            log("  fixture change only in comment / blank lines")
+            return set()
         i = self.fix.get(rel)
         if i is None:
             log("  unknown fixture", rel)
@@ -372,12 +377,40 @@ class Selector:
         for test_id, fields in spec["consumers"].items():
             proj = lambda pairs: [tuple(p[f] for f in fields) for p in pairs]  # noqa: E731
             if len(old_pairs) != len(new_pairs) or proj(old_pairs) != proj(new_pairs):
+                if fields == (0, 1) and self._executor_unaffected(old_pairs, new_pairs):
+                    log(f"  tpc fixture: {test_id.rsplit('::', 1)[-1]} unaffected (only non-executed queries, still parse)")
+                    continue
                 n = self.by_id.get(test_id)
                 if n is not None:
                     keep.add(n)
         log(f"  tpc fixture {rel}: {len(out)} -> {len(keep)} tests")
         self.spare |= out - keep
         return keep
+
+    def _executor_unaffected(self, old_pairs, new_pairs):
+        """tests/test_executor.py::_mp_execute calls parse_one(sql) on every pair but
+        executes / compares only pairs whose meta has "execute". So the executor test can't
+        change if no meta changed, no executed pair's sql changed, and every changed sql
+        still parses (checked with the pristine sqlglot; only when no sqlglot code is patched)."""
+        if len(old_pairs) != len(new_pairs) or self.patched:
+            return False
+        changed = [i for i, (a, b) in enumerate(zip(old_pairs, new_pairs)) if a[:2] != b[:2]]
+        for i in changed:
+            (om, osql, _), (nm, nsql, _) = old_pairs[i], new_pairs[i]
+            if om != nm or json.loads(nm).get("execute"):
+                return False
+        try:
+            if str(SRC) not in sys.path:
+                sys.path.insert(0, str(SRC))
+            import unittest  # noqa: F401  (UNITTEST strictness as under pytest)
+
+            from sqlglot import parse_one
+
+            for i in changed:
+                parse_one(new_pairs[i][1])
+        except Exception:
+            return False
+        return True
 
     def ids_of(self, n):
         if not hasattr(self, "_id_by_num"):
@@ -938,6 +971,12 @@ TPC_FIXTURES = {
     },
 }
 _helpers_mod = None
+
+
+def _fixture_text(text):
+    """What the fixture loaders see (tests.helpers._filter_comments, pristine helpers)."""
+    _fixture_pairs("")
+    return _helpers_mod._filter_comments(text)
 
 
 def _fixture_pairs(text):
