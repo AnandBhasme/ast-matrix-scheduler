@@ -182,6 +182,26 @@ def _norm(node):
     return ast.dump(node, include_attributes=False)
 
 
+def same_ast(a, b):
+    """_norm(a) == _norm(b) without building the dumps: structural equality ignoring
+    positions, stopping at the first difference. Type-strict (True != 1 != 1.0)."""
+    stack = [(a, b)]
+    while stack:
+        x, y = stack.pop()
+        if type(x) is not type(y):
+            return False
+        if isinstance(x, ast.AST):
+            for f in x._fields:
+                stack.append((getattr(x, f, None), getattr(y, f, None)))
+        elif type(x) is list:
+            if len(x) != len(y):
+                return False
+            stack.extend(zip(x, y))
+        elif x != y:
+            return False
+    return True
+
+
 # --------------------------------------------------------------------------- selector
 
 
@@ -376,7 +396,7 @@ class Selector:
             for u in self.test_importers(rel):  # a broken module breaks its importers too
                 out |= set(self.by_file.get(u, ()))
             return out
-        if _norm(old_tree) == _norm(new_tree):
+        if same_ast(old_tree, new_tree):
             return set()
         if rel not in self.by_file:
             return ALL  # helpers / conftest: shared by many modules
@@ -481,12 +501,10 @@ class Selector:
         idx = self.index(rel)
         if idx is None:
             return ALL
-        if _norm(idx.tree) == _norm(new_tree):
+        if same_ast(idx.tree, new_tree):
             log("  AST unchanged (comments/formatting)")
             return set()
-        if EQUIV and _norm(_Equiv().visit(ast.parse(self.source(rel)))) == _norm(
-            _Equiv().visit(ast.parse(new))
-        ):
+        if EQUIV and same_ast(_Equiv().visit(ast.parse(self.source(rel))), _Equiv().visit(ast.parse(new))):
             log("  semantically equivalent (identity vs equality against None/enum member)")
             return set()
         module = rel[:-3].replace("/", ".")
@@ -1343,7 +1361,9 @@ def import_diff(sel):
 
 # --------------------------------------------------------------------------- replay
 
-REPLAY = os.environ.get("BR_REPLAY", "1") != "0"
+# off by default since V10: with the mutation table, replay / verification cost more CPU
+# than the simulated time they still save (400 random mutants: 1599 -> 1560 s total)
+REPLAY = os.environ.get("BR_REPLAY", "0") != "0"
 FP_DIR = Path(os.environ.get("FP_DIR", APP))
 RMAP = Path(os.environ.get("REPLAY_MAP", APP / "replay_map.json.gz"))
 REPLAY_TARGETS = (
@@ -1440,7 +1460,7 @@ def replay_prune(sel, chosen, ms, cid):
 
 # --------------------------------------------------------------------------- verification
 
-VERIFY = os.environ.get("BR_VERIFY", "1") != "0"
+VERIFY = os.environ.get("BR_VERIFY", "0") != "0"
 VERIFY_ALL = os.environ.get("BR_VERIFY_ALL") == "1"  # local fidelity checks only
 REIMPORT = os.environ.get("BR_REIMPORT", "1") != "0"
 V_TEST_CAP = float(os.environ.get("BR_V_TEST_CAP", "1500"))  # ms per verified test
@@ -1682,7 +1702,7 @@ def table_ok(sel, files):
             return False
         try:
             src, new, _, _ = sel._apply(rel, f["hunks"])
-            same = ast.dump(ast.parse(src)) == ast.dump(ast.parse(new))
+            same = same_ast(ast.parse(src), ast.parse(new))
         except Exception:
             same = False
         code += not same
