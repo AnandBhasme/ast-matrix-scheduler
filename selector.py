@@ -1748,6 +1748,29 @@ def mtable_key(rel, ln, new_line):
     return hashlib.sha1(f"{rel}\0{ln}\0{new_line}".encode()).hexdigest()[:16]
 
 
+def _strip_added_comments(a, b, new):
+    """A commit may add comment / blank lines in the same file as a one-line mutation
+    (that shifts every later line, so the key misses). Drop *added* lines that are blank
+    or pure comments, if the result has exactly the same AST as the patched file (so no
+    `#` line inside a string was removed); return the stripped lines or None."""
+    import difflib
+
+    keep, dropped = [], 0
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "insert" and all(not x.strip() or x.lstrip().startswith("#") for x in b[j1:j2]):
+            dropped += j2 - j1
+            continue
+        keep.extend(b[j1:j2])
+    if not dropped:
+        return None
+    try:
+        if not same_ast(ast.parse(new), ast.parse("\n".join(keep))):
+            return None
+    except SyntaxError:
+        return None
+    return keep
+
+
 def mtable_lookup(rel, src, new):
     if os.environ.get("BR_MTABLE", "1") == "0":
         return None
@@ -1762,7 +1785,9 @@ def mtable_lookup(rel, src, new):
         return None
     a, b = src.split("\n"), new.split("\n")
     if len(a) != len(b):
-        return None
+        b = _strip_added_comments(a, b, new)
+        if b is None or len(a) != len(b):
+            return None
     diff = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
     if len(diff) != 1:
         return None
