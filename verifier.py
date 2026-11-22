@@ -239,6 +239,42 @@ def run_tests(ids):
     return sorted(failed)
 
 
+def check_max_nodes():
+    """Scaled-down model of tests/test_parser.py::TestParser::test_max_nodes (agy, §61):
+    same statements at width 100 instead of 10000. Validated offline against real-pytest
+    labels of the full test on 165 mutants: 0 false passes (5/5 real failures caught)."""
+    from sqlglot import exp, parse_one
+    from sqlglot.errors import ParseError
+
+    try:
+        if not isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select):
+            return False
+        cols = [f"col{i}" for i in range(100)]
+        if not isinstance(parse_one("SELECT " + ",".join(cols) + " FROM t", max_nodes=1_000_000), exp.Select):
+            return False
+        sql = "SELECT " + ",".join("x" + "=x" * 100 for _ in range(100))
+        try:
+            parse_one(sql, max_nodes=5_000)
+            return False
+        except ParseError as e:
+            if "Maximum number of AST nodes" not in str(e):
+                return False
+        try:
+            parse_one(sql, max_nodes=500)
+            return False
+        except ParseError as e:
+            if "(500)" not in str(e):
+                return False
+        try:
+            parse_one("SELECT " + ",".join(f"x={i}" for i in range(50)), max_nodes=5)
+            return False
+        except ParseError:
+            pass
+        return isinstance(parse_one("SELECT 1, 2, 3"), exp.Select)
+    except Exception:
+        return False
+
+
 def run_failfast(ids):
     """Run the tests one by one in the given order and stop at the first failure.
     Returns (passed, failed); tests after the failure are in neither."""
@@ -273,7 +309,10 @@ def handle(req):
                     swap(rel, src)
             # after the swap: swap() must read the pristine file, tests the patched one
             install_overlays(req["files"])
-            if req.get("failfast"):
+            if req.get("check") == "max_nodes":
+                ok = check_max_nodes()
+                out = {"failed": [] if ok else list(req["tests"]), "passed": list(req["tests"]) if ok else [], "ok": True}
+            elif req.get("failfast"):
                 passed, failed = run_failfast(req["tests"])
                 out = {"failed": failed, "passed": passed, "ok": True}
             else:

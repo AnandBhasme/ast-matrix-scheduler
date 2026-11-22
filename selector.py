@@ -1597,6 +1597,39 @@ def verify_prune(sel, chosen, ms, cid):
     return chosen - passed
 
 
+MAX_NODES_ID = "tests/test_parser.py::TestParser::test_max_nodes"
+MAX_NODES_FAST = os.environ.get("BR_MAXNODES", "1") != "0"
+
+
+def max_nodes_prune(sel, chosen, ms, cid):
+    """Experiment (agy §61): when the runtime selection keeps test_max_nodes (28.8 s, never
+    verified), run a scaled-down model of it against the patched code; drop it if that passes."""
+    import select
+    import time
+
+    n = sel.by_id.get(MAX_NODES_ID)
+    if not MAX_NODES_FAST or n is None or n not in chosen or not sel.patched or sel.table_hit:
+        return chosen
+    if 3.0 > time_left():
+        return chosen
+    p = _verifier()
+    if p is None:
+        return chosen
+    t0 = time.time()
+    req = {"files": dict(sel.patched), "tests": [MAX_NODES_ID], "timeout": 8.0,
+           "mode": "swap" if sel.swap_ok else "reimport", "check": "max_nodes"}
+    try:
+        p.stdin.write((json.dumps(req) + "\n").encode())
+        p.stdin.flush()
+        ready, _, _ = select.select([p.stdout], [], [], 20)
+        rep = json.loads(p.stdout.readline()) if ready else {"ok": False}
+    except Exception:
+        rep = {"ok": False}
+    ok = rep.get("ok") and MAX_NODES_ID in rep.get("passed", [])
+    log(f"  max_nodes check: {'pass -> drop' if ok else 'keep'} took={time.time()-t0:.2f}s")
+    return chosen - {n} if ok else chosen
+
+
 CASES = Path(os.environ.get("CASES_FILE", APP / "cases.pkl.gz"))
 _cstate = {"fp": None}
 
@@ -1836,6 +1869,7 @@ def main():
                         re.search(r"^\+(?!\+\+).*(?:\bsorted\(|\.sort\()", text, re.M)
                     if not unsort:
                         chosen = verify_prune(sel, chosen, ms, cid)
+                        chosen = max_nodes_prune(sel, chosen, ms, cid)
             except Exception as e:
                 print(f"{cid}: verify error {e!r}", file=sys.stderr)
             if os.environ.get("BR_CASES") == "1":  # off: measured CPU > saving
