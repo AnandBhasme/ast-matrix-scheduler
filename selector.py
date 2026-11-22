@@ -1881,6 +1881,31 @@ def main():
         # test_generator_memory unconditionally is unsound: test_max_nodes also
         # asserts that ordinary queries parse, so it fails whenever basic parsing or
         # the import breaks (verified on a tokenizer_core.py mutant: 300 s miss).
+        # PROBE C (not a real selector): empty selection for table-miss commits whose every
+        # sqlglot/*.py change is a clean single-line replacement (same line count, one line
+        # differs) or comment-only -> "commits missed" counts table misses from unknown operators
+        if sel is not None and not sel.table_hit and chosen and files and any(
+                (f.get("new") or "").startswith("sqlglot/") for f in files):
+            single, has_code = True, False
+            for f in files:
+                rel = f.get("new") or ""
+                if not (rel.startswith("sqlglot/") and rel.endswith(".py")):
+                    continue
+                try:
+                    src, new, _, _ = sel._apply(rel, f["hunks"])
+                except Exception:
+                    single = False
+                    break
+                a_, b_ = src.split("\n"), new.split("\n")
+                if same_ast(ast.parse(src), ast.parse(new)):
+                    continue
+                if len(a_) != len(b_) or sum(x != y for x, y in zip(a_, b_)) != 1:
+                    single = False
+                    break
+                has_code = True
+            if single and has_code:
+                log("  PROBE C: single-line table miss -> empty")
+                chosen = set()
         workers = partition(sorted(chosen), ms)
         if sel is not None:
             if workers:
