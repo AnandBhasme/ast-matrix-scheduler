@@ -362,6 +362,7 @@ class Selector:
         spec = TPC_FIXTURES.get(rel)
         if spec is not None:
             out = self.tpc_fixture(rel, src, new, out, spec)
+        self.patched[rel] = new  # overlay-verifiable: non-.py, no code to swap (verifier skips swap())
         return out
 
     def tpc_fixture(self, rel, src, new, out, spec):
@@ -1900,8 +1901,17 @@ def main():
             except Exception as e:  # never let replay break a commit
                 print(f"{cid}: replay error {e!r}", file=sys.stderr)
             try:
-                if all((f["new"] or "").startswith("sqlglot/") and (f["new"] or "").endswith(".py")
-                       and f["old"] == f["new"] for f in files):
+                def _verifiable(f):
+                    new_ = f["new"] or ""
+                    if f["old"] != f["new"]:
+                        return False
+                    if new_.startswith("sqlglot/") and new_.endswith(".py"):
+                        return True
+                    # a non-.py fixture file: select_fixture tracks it in sel.patched too,
+                    # and the verifier overlays its text without trying to swap/compile it
+                    return new_.startswith("tests/") and not new_.endswith(".py")
+
+                if all(_verifiable(f) for f in files):
                     # removed sorted()/sort(): order may depend on the hash seed, which a
                     # single verifier process cannot explore -> never prune by verification
                     unsort = re.search(r"^-(?!--).*(?:\bsorted\(|\.sort\()", text, re.M) and not \

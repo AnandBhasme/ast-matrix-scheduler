@@ -329,7 +329,8 @@ def handle(req):
                 reimport(req["files"])
             else:
                 for rel, src in req["files"].items():
-                    swap(rel, src)
+                    if rel.endswith(".py"):  # non-.py (e.g. a fixture): overlay-only, no code to swap
+                        swap(rel, src)
             # after the swap: swap() must read the pristine file, tests the patched one
             install_overlays(req["files"])
             if req.get("check") == "max_nodes":
