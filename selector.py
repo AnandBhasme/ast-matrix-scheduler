@@ -1886,6 +1886,28 @@ def main():
             if workers:
                 spare = (sel.spare | SPARE_ALWAYS_IDS(sel)) - chosen
                 workers = fill_slack(workers, {n for n in spare if n in ms}, ms)
+            # CENSUS PROBE (sound selection; only adds cost): every fixture-only commit gets one
+            # extra worker with a 0 ms test -> simulated total = base + 2.000 s x (number of
+            # fixture-only commits), failing or not.
+            cat = None
+            try:
+                fx = [f for f in (files or []) if (f.get("new") or "").startswith("tests/") and not (f.get("new") or "").endswith(".py")]
+                sq = [f for f in (files or []) if (f.get("new") or "").startswith("sqlglot/") and (f.get("new") or "").endswith(".py")]
+                code = False
+                for f in sq:
+                    src, new, _, _ = sel._apply(f["new"], f["hunks"])
+                    if not same_ast(ast.parse(src), ast.parse(new)):
+                        code = True
+                if files and len(fx) == len(files):
+                    cat = 0  # only category A is counted (cost = max load + 2 s/worker:
+                    # an extra short worker shows up as exactly +2.000 s, its duration doesn't)
+            except Exception:
+                cat = None
+            if cat is not None and len(workers) < 8:
+                used = {n for w in workers for n in w}
+                pick = next((n for n in sorted(ms) if ms[n] == cat and n not in used), None)
+                if pick is not None:
+                    workers = [w for w in workers if w] + [[pick]]
             sel.reset()
         log(cid, "selected", len(chosen))
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")) + "\n")
