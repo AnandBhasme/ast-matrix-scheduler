@@ -24,6 +24,7 @@ import importlib.machinery
 import json
 import os
 import pickle
+import re
 import pkgutil
 import select
 import signal
@@ -213,13 +214,28 @@ class _SubTestFailFast(unittest.TestResult):
         pass
 
 
-def run_tests(ids):
+def run_tests(ids, per_module=False):
+    """per_module (labelling): a test module that fails to import fails all of its
+    requested tests (as a pytest collection error would) and the others still run;
+    a setUpClass/module error fails only the tests under that class/module."""
     failed = set()
     by_uid = {}
     suite = unittest.TestSuite()
+    broken = set()
     for tid in ids:
         mod, rest = _uid(tid)
-        m = importlib.import_module(mod)
+        if per_module:
+            if mod in broken:
+                failed.add(tid)
+                continue
+            try:
+                m = importlib.import_module(mod)
+            except Exception:
+                broken.add(mod)
+                failed.add(tid)
+                continue
+        else:
+            m = importlib.import_module(mod)
         obj = m
         for r in rest:
             obj = getattr(obj, r)
@@ -235,7 +251,14 @@ def run_tests(ids):
             failed.add(hit)
         else:
             # setUpClass / module-level errors etc.: be conservative
-            failed.update(by_uid.values())
+            scope = None
+            if per_module:
+                mm = re.search(r"\((tests\.[\w.]+)\)", str(tid) + " " + str(getattr(case, "description", "")))
+                scope = mm.group(1) if mm else None
+            if scope:
+                failed.update(v for u, v in by_uid.items() if u == scope or u.startswith(scope + "."))
+            else:
+                failed.update(by_uid.values())
     return sorted(failed)
 
 
@@ -316,7 +339,7 @@ def handle(req):
                 passed, failed = run_failfast(req["tests"])
                 out = {"failed": failed, "passed": passed, "ok": True}
             else:
-                failed = run_tests(req["tests"])
+                failed = run_tests(req["tests"], per_module=bool(req.get("per_module")))
                 out = {"failed": failed, "passed": [t for t in req["tests"] if t not in failed], "ok": True}
         except BaseException as e:  # noqa: BLE001
             out = {"failed": list(req["tests"]), "ok": False, "err": repr(e)[:200]}
