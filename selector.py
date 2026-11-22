@@ -1361,9 +1361,9 @@ def import_diff(sel):
 
 # --------------------------------------------------------------------------- replay
 
-# off by default since V10: with the mutation table, replay / verification cost more CPU
-# than the simulated time they still save (400 random mutants: 1599 -> 1560 s total)
-REPLAY = os.environ.get("BR_REPLAY", "0") != "0"
+# V10 turned these off (measured on synthetic mutants); the official practice set lost 25 s
+# simulated for 3.3 s CPU -> back on (V10.2)
+REPLAY = os.environ.get("BR_REPLAY", "1") != "0"
 FP_DIR = Path(os.environ.get("FP_DIR", APP))
 RMAP = Path(os.environ.get("REPLAY_MAP", APP / "replay_map.json.gz"))
 REPLAY_TARGETS = (
@@ -1460,7 +1460,7 @@ def replay_prune(sel, chosen, ms, cid):
 
 # --------------------------------------------------------------------------- verification
 
-VERIFY = os.environ.get("BR_VERIFY", "0") != "0"
+VERIFY = os.environ.get("BR_VERIFY", "1") != "0"
 VERIFY_ALL = os.environ.get("BR_VERIFY_ALL") == "1"  # local fidelity checks only
 REIMPORT = os.environ.get("BR_REIMPORT", "1") != "0"
 V_TEST_CAP = float(os.environ.get("BR_V_TEST_CAP", "1500"))  # ms per verified test
