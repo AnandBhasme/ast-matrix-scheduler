@@ -1849,7 +1849,7 @@ def main():
         # the import breaks (verified on a tokenizer_core.py mutant: 300 s miss).
         # PROBE (not a real selector): empty selection for a category of commits, to read
         # from the official "commits missed" count how many of them fail and what they cost
-        probe = os.environ.get("BR_PROBE", "nontable")
+        probe = os.environ.get("BR_PROBE", "fixture")
         if sel is not None and probe == "nontable" and not sel.table_hit and any(
                 (f.get("new") or "").startswith("sqlglot/") for f in (files or [])):
             chosen = set()
