@@ -28,6 +28,7 @@ import csv
 import gzip
 import hashlib
 import json
+import unittest  # noqa: F401  before sqlglot: expressions.core.UNITTEST must match pytest (strict arg checks)
 import os
 import pickle
 import sys

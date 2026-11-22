@@ -15,6 +15,7 @@ import hashlib
 import importlib
 import inspect
 import json
+import unittest  # noqa: F401  before sqlglot: expressions.core.UNITTEST must match pytest (strict arg checks)
 import pkgutil
 import re
 import sys
